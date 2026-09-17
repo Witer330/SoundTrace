@@ -1,0 +1,30 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#152742"/>
+      <stop offset="1" stop-color="#0A1526"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5EEAD4"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="230" fill="url(#bg)"/>
+
+  <!-- 声波：7 根对称波形条 -->
+  <g fill="url(#wave)">
+    <rect x="120" y="392" width="52" height="96"  rx="26"/>
+    <rect x="242" y="336" width="52" height="208" rx="26"/>
+    <rect x="364" y="284" width="52" height="312" rx="26"/>
+    <rect x="486" y="232" width="52" height="416" rx="26"/>
+    <rect x="608" y="284" width="52" height="312" rx="26"/>
+    <rect x="730" y="336" width="52" height="208" rx="26"/>
+    <rect x="852" y="392" width="52" height="96"  rx="26"/>
+  </g>
+
+  <!-- 迹线：声音留下的痕迹 -->
+  <line x1="170" y1="742" x2="786" y2="742" stroke="#34D399" stroke-width="14" stroke-linecap="round" opacity="0.92"/>
+  <circle cx="856" cy="742" r="52" fill="none" stroke="#34D399" stroke-width="8" opacity="0.28"/>
+  <circle cx="856" cy="742" r="30" fill="#34D399"/>
+</svg>
