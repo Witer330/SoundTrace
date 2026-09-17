@@ -15,13 +15,14 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn insert_recording(db: &Db, title: &str) -> i64 {
     let conn = db.conn.lock().unwrap();
+    let params: [&dyn rusqlite::ToSql; 2] = [&format!("hash-{title}"), &title];
     conn.query_row(
         "INSERT INTO recordings(file_hash, file_path, orig_name, title, duration_sec, size_bytes,
                                 format, status, notes, participants, created_at, updated_at)
          VALUES(?1, 'C:/lib/x.m4a', 'x.m4a', ?2, 60.0, 1024, 'm4a', 'done', '', '',
                 '2026-09-17T00:00:00Z', '2026-09-17T00:00:00Z')
          RETURNING id",
-        rusqlite::params![format!("hash-{title}"), title],
+        &params[..],
         |r| r.get(0),
     )
     .unwrap()

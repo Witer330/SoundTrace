@@ -18,6 +18,22 @@ use tauri::Emitter;
 const SAMPLE_RATE: i32 = 16000;
 const VAD_WINDOW: usize = 512;
 
+/// 已知缺陷（2026-09-18 定位）：sherpa-onnx 的 Paraformer 解码在**特定内容**上会破坏栈保护，
+/// 表现为 `0xc0000409 / FAST_FAIL_STACK_COOKIE_CHECK_FAILURE` + `fatal runtime error: Rust
+/// cannot catch foreign exceptions`，进程直接退出——用户侧看到的是转写中应用闪退。
+///
+/// 已确立的事实（可复现）：
+///   1. 崩溃点在 `OfflineRecognizer::decode()` **内部**，属原生库缺陷，Rust 侧无法捕获或兜底；
+///   2. debug 与 release 均复现，与构建优化无关；
+///   3. 与音频时长**无单调关系**：同一条录音里 2 秒/6 秒片段必过，而 3.3 秒的一段必崩；
+///   4. 与线程数无关（1/2/4/8/20 线程都会崩，线程数只改变复现概率）；
+///   5. 是**内容相关**而非系统性缺陷：普通片段连续解码 40 轮零崩溃，问题片段约每 10 轮崩一次；
+///   6. 重编码、重采样、限幅、滤波都不能规避，说明不是编码或电平问题。
+///
+/// 因此不要指望靠切片/限长/换线程来修（都试过，无效）。真正的修法是把转写放到**独立子进程**
+/// 里跑，崩了由父进程重启并跳过问题片段——见 docs/开发记录.md 的「已知缺陷」一节。
+const _KNOWN_NATIVE_CRASH_NOTE: () = ();
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct JobEvent {
@@ -321,6 +337,9 @@ pub struct SegRow {
     pub chars: String,
 }
 
+/// 识别一个 VAD 片段：建流、解码、标点，并把字符时间戳映射回全局时间轴。
+/// 注意：`decode()` 内部存在已知原生层崩溃（见文件顶部 `_KNOWN_NATIVE_CRASH_NOTE`），
+/// 崩溃时整个进程退出，此处无法用 Result 兜住。
 fn recognize_segment(
     recognizer: &OfflineRecognizer,
     punct: &OfflinePunctuation,
