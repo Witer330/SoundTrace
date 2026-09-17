@@ -30,6 +30,9 @@ tauri-plugin-dialog = "2"
 sherpa-onnx = "1.13.8"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
+[dev-dependencies]
+glob = "0.3"
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
