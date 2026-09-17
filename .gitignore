@@ -25,3 +25,4 @@ dist-ssr
 /tools/icon-gen/target
 testdata/
 tools/icon-gen/target/
+.zcode/

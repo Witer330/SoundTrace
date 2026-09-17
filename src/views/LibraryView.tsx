@@ -17,11 +17,11 @@ import {
 
 function StatusBadge({ status }: { status: RecordingStatus }) {
   const style: Record<RecordingStatus, string> = {
-    imported: "bg-ink-700 text-mist-300",
-    queued: "bg-amber-900/60 text-amber-200",
-    transcribing: "bg-cyan-900/60 text-cyan-200 animate-pulse",
-    done: "bg-emerald-900/60 text-emerald-200",
-    failed: "bg-red-900/60 text-red-200",
+    imported: "bg-st-muted-soft text-st-muted",
+    queued: "bg-st-warn-soft text-st-warn",
+    transcribing: "bg-st-info-soft text-st-info animate-pulse",
+    done: "bg-st-ok-soft text-st-ok",
+    failed: "bg-st-err-soft text-st-err",
   };
   return (
     <span className={`px-2 py-0.5 rounded text-xs ${style[status]}`}>
@@ -235,9 +235,9 @@ export default function LibraryView() {
           </>
         ) : filtered.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
-            <svg width="88" height="88" viewBox="0 0 1024 1024" className="opacity-60">
-              <rect width="1024" height="1024" rx="230" fill="#14203a" />
-              <g fill="#22d3ee" opacity="0.85">
+            <svg width="88" height="88" viewBox="0 0 1024 1024" className="opacity-70">
+              <rect width="1024" height="1024" rx="230" className="fill-ink-850" />
+              <g className="fill-cyan-accent" opacity="0.85">
                 <rect x="120" y="392" width="52" height="96" rx="26" />
                 <rect x="242" y="336" width="52" height="208" rx="26" />
                 <rect x="364" y="284" width="52" height="312" rx="26" />
@@ -246,8 +246,17 @@ export default function LibraryView() {
                 <rect x="730" y="336" width="52" height="208" rx="26" />
                 <rect x="852" y="392" width="52" height="96" rx="26" />
               </g>
-              <line x1="170" y1="742" x2="786" y2="742" stroke="#34d399" strokeWidth="14" strokeLinecap="round" opacity="0.92" />
-              <circle cx="856" cy="742" r="30" fill="#34d399" />
+              <line
+                x1="170"
+                y1="742"
+                x2="786"
+                y2="742"
+                className="stroke-jade-accent"
+                strokeWidth="14"
+                strokeLinecap="round"
+                opacity="0.92"
+              />
+              <circle cx="856" cy="742" r="30" className="fill-jade-accent" />
             </svg>
             <div className="text-mist-300">录音库还是空的</div>
             <div className="text-mist-400 text-sm">
@@ -292,10 +301,9 @@ export default function LibraryView() {
 
       {/* 拖拽遮罩 */}
       {dragging && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-ink-950/80 backdrop-blur-sm">
-          <div className="border-2 border-dashed border-cyan-accent/60 rounded-2xl px-16 py-12 text-center">
-            <div className="text-cyan-accent text-lg">松手导入录音</div>
-            <div className="text-mist-400 text-sm mt-1">支持文件或文件夹（递归扫描）</div>
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-ink-950/60 backdrop-blur-sm">
+          <div className="border-2 border-dashed border-cyan-accent/50 rounded-2xl px-16 py-12 text-center">
+            <div className="text-cyan-accent text-lg">松手导入录音</div>            <div className="text-mist-400 text-sm mt-1">支持文件或文件夹（递归扫描）</div>
           </div>
         </div>
       )}

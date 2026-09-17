@@ -2,21 +2,49 @@ import { create } from "zustand";
 import type { Recording, View } from "./types";
 import { isTauri, listRecordings } from "./api";
 
+export type ThemeMode = "system" | "light" | "dark";
+export type Theme = "light" | "dark";
+
+const THEME_KEY = "st.theme";
+
+function systemTheme(): Theme {
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+/** 把已解析的主题写到 <html data-theme>，驱动 styles.css 里的变量切换 */
+function applyTheme(theme: Theme) {
+  const root = document.documentElement;
+  root.dataset.theme = theme;
+  // 同步 color-scheme，让滚动条与原生控件（含 <select> 下拉）跟随主题
+  root.style.colorScheme = theme;
+}
+
+function readStoredMode(): ThemeMode {
+  const v = localStorage.getItem(THEME_KEY);
+  return v === "light" || v === "dark" || v === "system" ? v : "system";
+}
+
 interface AppState {
   view: View;
   recordings: Recording[];
   recordingsLoaded: boolean;
   libraryQuery: string;
+  theme: Theme;
+  themeMode: ThemeMode;
   go: (view: View) => void;
   setLibraryQuery: (q: string) => void;
   refreshRecordings: () => Promise<void>;
+  initTheme: () => void;
+  setThemeMode: (mode: ThemeMode) => void;
 }
 
-export const useAppStore = create<AppState>((set) => ({
+export const useAppStore = create<AppState>((set, get) => ({
   view: { kind: "library" },
   recordings: [],
   recordingsLoaded: false,
   libraryQuery: "",
+  theme: "dark",
+  themeMode: "system",
 
   go: (view) => {
     set({ view });
@@ -44,4 +72,30 @@ export const useAppStore = create<AppState>((set) => ({
       // 后端未就绪时保持现状，由调用方决定是否提示
     }
   },
+
+  initTheme: () => {
+    const mode = readStoredMode();
+    const theme = mode === "system" ? systemTheme() : mode;
+    applyTheme(theme);
+    set({ themeMode: mode, theme });
+    // 「跟随系统」时响应系统切换；手动模式下 media 变化不影响
+    window.matchMedia?.("(prefers-color-scheme: light)").addEventListener("change", () => {
+      if (get().themeMode !== "system") return;
+      const next = systemTheme();
+      applyTheme(next);
+      set({ theme: next });
+    });
+  },
+
+  setThemeMode: (mode) => {
+    localStorage.setItem(THEME_KEY, mode);
+    const theme = mode === "system" ? systemTheme() : mode;
+    applyTheme(theme);
+    set({ themeMode: mode, theme });
+  },
 }));
+
+// 调试与端到端验证用：在浏览器控制台里可直接切换视图/主题
+if (import.meta.env.DEV) {
+  (window as unknown as { __store: typeof useAppStore }).__store = useAppStore;
+}

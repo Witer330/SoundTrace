@@ -276,7 +276,7 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
       {(status === "imported" || status === "failed") && (
         <div className="flex flex-col items-center gap-2 py-8">
           {status === "failed" && error && (
-            <div className="text-xs text-red-300 max-w-md text-center">{error}</div>
+            <div className="text-xs text-st-err max-w-md text-center">{error}</div>
           )}
           <button
             className="px-4 py-2 rounded-lg text-sm bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium hover:opacity-90"
@@ -338,7 +338,7 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
       )}
 
       {status !== "done" && status !== "queued" && status !== "transcribing" && error && (
-        <div className="text-xs text-red-300">{error}</div>
+        <div className="text-xs text-st-err">{error}</div>
       )}
     </div>
   );

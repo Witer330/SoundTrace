@@ -222,7 +222,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   if (error && !rec) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3">
-        <div className="text-red-300 text-sm">{error}</div>
+        <div className="text-st-err text-sm">{error}</div>
         <button className="text-mist-400 hover:text-mist-200 text-sm" onClick={() => go({ kind: "library" })}>
           返回录音库
         </button>
@@ -284,7 +284,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
           {savedFlash ? "已保存 ✓" : saving ? "保存中…" : "保存"}
         </button>
         <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-red-900/60 hover:bg-red-800/70 text-red-200"
+          className="px-3 py-1.5 rounded-lg text-sm bg-st-err-soft hover:bg-st-err/20 text-st-err"
           onClick={doDelete}
         >
           删除
@@ -332,7 +332,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
                     <span className="tabular-nums text-ink-500">{formatMsTime(bm.timeMs)}</span>
                     {bm.label}
                     <button
-                      className="text-ink-500 hover:text-red-300 opacity-0 group-hover:opacity-100"
+                      className="text-ink-500 hover:text-st-err opacity-0 group-hover:opacity-100"
                       onClick={(e) => {
                         e.stopPropagation();
                         void removeBookmark(bm.id);
@@ -438,9 +438,9 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
       </div>
 
       {error && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-red-900/70 text-red-100 text-sm shadow-lg">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-st-err-soft border border-st-err/40 text-st-err text-sm shadow-lg">
           {error}
-          <button className="ml-3 text-red-200/70 hover:text-red-100" onClick={() => setError("")}>
+          <button className="ml-3 text-st-err/70 hover:text-st-err" onClick={() => setError("")}>
             ✕
           </button>
         </div>

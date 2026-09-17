@@ -77,10 +77,10 @@ export default function SummaryPanel({ rec, onChanged }: Props) {
           正在生成（长会议需 1~3 分钟）… · 仅转写文本出网，录音不出本机
         </div>
       )}
-      {error && <div className="text-xs text-red-300">{error}</div>}
+      {error && <div className="text-xs text-st-err">{error}</div>}
 
       {rec.summaryMd && (
-        <div className="prose-invert max-w-none text-sm leading-6 text-mist-200 [&_h2]:text-mist-100 [&_h2]:mt-4 [&_h2]:mb-2 [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-mist-200 [&_table]:w-full [&_table]:text-xs [&_th]:border [&_th]:border-ink-700 [&_th]:px-2 [&_th]:py-1 [&_th]:bg-ink-850 [&_td]:border [&_td]:border-ink-700 [&_td]:px-2 [&_td]:py-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_hr]:border-ink-700 [&_strong]:text-mist-100">
+        <div className="md-body max-w-none text-sm leading-6 text-mist-200">
           <Markdown remarkPlugins={[remarkGfm]}>{rec.summaryMd}</Markdown>
         </div>
       )}

@@ -15,6 +15,7 @@ import {
 } from "../api";
 import type { AppInfo } from "../types";
 import { formatBytes } from "../types";
+import { useAppStore, type ThemeMode } from "../store";
 
 function Card({
   title,
@@ -33,6 +34,40 @@ function Card({
       </div>
       {children}
     </section>
+  );
+}
+
+/** 外观：深色 / 浅色 / 跟随系统 */
+function AppearanceCard() {
+  const themeMode = useAppStore((s) => s.themeMode);
+  const setThemeMode = useAppStore((s) => s.setThemeMode);
+
+  const options: { key: ThemeMode; label: string; hint: string }[] = [
+    { key: "system", label: "跟随系统", hint: "随 Windows 的深浅色设置自动切换" },
+    { key: "dark", label: "深色", hint: "深空蓝底，长时间盯波形不刺眼" },
+    { key: "light", label: "浅色", hint: "近白底，白天与投屏时更清晰" },
+  ];
+
+  return (
+    <Card title="外观" desc="主题切换即时生效，选择会记住并在下次启动时直接套用">
+      <div className="flex gap-2">
+        {options.map((o) => (
+          <button
+            key={o.key}
+            onClick={() => setThemeMode(o.key)}
+            title={o.hint}
+            className={`flex-1 px-3 py-2 rounded-lg text-sm border transition-colors ${
+              themeMode === o.key
+                ? "bg-ink-700 border-cyan-accent/60 text-mist-100 font-medium"
+                : "bg-ink-850 border-ink-700 text-mist-300 hover:border-ink-600"
+            }`}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+      <div className="text-[11px] text-ink-500">{options.find((o) => o.key === themeMode)?.hint}</div>
+    </Card>
   );
 }
 
@@ -74,7 +109,7 @@ function ModelsCard() {
       title="转写模型（本地离线）"
       desc="Paraformer-large（字符级时间戳）+ silero-VAD + CT-Transformer 标点 · 全部在本机推理"
     >
-      {error && <div className="text-xs text-red-300">{error}</div>}
+      {error && <div className="text-xs text-st-err">{error}</div>}
       <div className="space-y-2">
         {statuses.map((m) => {
           const p = progress[m.id];
@@ -208,10 +243,12 @@ export default function SettingsView() {
     <div className="h-full overflow-y-auto p-4">
       <div className="max-w-2xl space-y-4">
         {error && (
-          <div className="px-3 py-2 rounded-lg bg-red-900/40 border border-red-800/60 text-red-200 text-sm">
+          <div className="px-3 py-2 rounded-lg bg-st-err-soft border border-st-err/40 text-st-err text-sm">
             {error}
           </div>
         )}
+
+        <AppearanceCard />
 
         <Card title="存储" desc="录音归档、数据库与模型文件的位置">
           <div className="flex items-center gap-2">
@@ -285,7 +322,7 @@ export default function SettingsView() {
             {testResult && (
               <span
                 className={`text-xs truncate max-w-xs ${
-                  testResult.startsWith("失败") ? "text-red-300" : "text-jade-accent"
+                  testResult.startsWith("失败") ? "text-st-err" : "text-jade-accent"
                 }`}
               >
                 {testResult}

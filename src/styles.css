@@ -1,21 +1,120 @@
 @import "tailwindcss";
 
-@theme {
-  --color-ink-950: #0b1220;
-  --color-ink-900: #101a2c;
-  --color-ink-850: #14203a;
-  --color-ink-800: #1a2947;
-  --color-ink-700: #24365c;
-  --color-ink-600: #324673;
-  --color-ink-500: #4a5f8f;
-  --color-mist-400: #8ba0c4;
-  --color-mist-300: #aabdd9;
-  --color-mist-200: #ccd8ec;
-  --color-teal-accent: #5eead4;
-  --color-cyan-accent: #22d3ee;
-  --color-jade-accent: #34d399;
+/*
+ * 主题令牌（M5）
+ * ------------------------------------------------------------------
+ * 色阶是按深色主题命名的语义「槽位」，不是字面颜色：浅色主题下 ink 与 mist
+ * 的明暗关系整体反转（ink-950 = 页面底，浅色下是近白；mist-200 = 主文字，
+ * 浅色下是近黑）。因此 8 个视图文件里 257 处类名不需要改动，只在这里换变量值。
+ *
+ * @theme inline 让生成的工具类引用 var(--color-*)，而不是把十六进制值内联进去，
+ * 这样 :root[data-theme="light"] 覆盖 --st-* 就能在运行时生效；带透明度的类
+ * （bg-ink-900/60）编译为 color-mix(…, var(--color-ink-900), …)，同样跟随覆盖。
+ */
+@theme inline {
+  --color-ink-950: var(--st-ink-950);
+  --color-ink-900: var(--st-ink-900);
+  --color-ink-850: var(--st-ink-850);
+  --color-ink-800: var(--st-ink-800);
+  --color-ink-700: var(--st-ink-700);
+  --color-ink-600: var(--st-ink-600);
+  --color-ink-500: var(--st-ink-500);
+  --color-mist-100: var(--st-mist-100);
+  --color-mist-200: var(--st-mist-200);
+  --color-mist-300: var(--st-mist-300);
+  --color-mist-400: var(--st-mist-400);
+  --color-teal-accent: var(--st-teal-accent);
+  --color-cyan-accent: var(--st-cyan-accent);
+  --color-jade-accent: var(--st-jade-accent);
+
+  /* 状态色：替代写死的 emerald/amber/cyan/red 色阶，浅色下需换成「浅底 + 深字」 */
+  --color-st-ok: var(--st-ok);
+  --color-st-ok-soft: var(--st-ok-soft);
+  --color-st-warn: var(--st-warn);
+  --color-st-warn-soft: var(--st-warn-soft);
+  --color-st-info: var(--st-info);
+  --color-st-info-soft: var(--st-info-soft);
+  --color-st-err: var(--st-err);
+  --color-st-err-soft: var(--st-err-soft);
+  --color-st-muted: var(--st-muted);
+  --color-st-muted-soft: var(--st-muted-soft);
+
+  /* 说话人着色的三档循环（1/2/3 号轮流使用） */
+  --color-spk-1: var(--st-spk-1);
+  --color-spk-2: var(--st-spk-2);
+  --color-spk-3: var(--st-spk-3);
 
   --font-sans: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+}
+
+/* 深空蓝（默认） */
+:root {
+  --st-ink-950: #0b1220;
+  --st-ink-900: #101a2c;
+  --st-ink-850: #14203a;
+  --st-ink-800: #1a2947;
+  --st-ink-700: #24365c;
+  --st-ink-600: #324673;
+  --st-ink-500: #4a5f8f;
+  --st-mist-100: #e2eaf7;
+  --st-mist-200: #ccd8ec;
+  --st-mist-300: #aabdd9;
+  --st-mist-400: #8ba0c4;
+  --st-teal-accent: #5eead4;
+  --st-cyan-accent: #22d3ee;
+  --st-jade-accent: #34d399;
+
+  --st-ok: #6ee7b7;
+  --st-ok-soft: #05301f;
+  --st-warn: #fcd34d;
+  --st-warn-soft: #3a2a08;
+  --st-info: #67e8f9;
+  --st-info-soft: #0d3a4a;
+  --st-err: #fca5a5;
+  --st-err-soft: #4a1519;
+  --st-muted: #9fb0cd;
+  --st-muted-soft: #24365c;
+
+  --st-spk-1: #22d3ee;
+  --st-spk-2: #34d399;
+  --st-spk-3: #c4b5fd;
+
+  color-scheme: dark;
+}
+
+/* 浅色：贴合参考稿的观感（近白底 + 白卡 + 浅边框） */
+:root[data-theme="light"] {
+  --st-ink-950: #f4f6fb;
+  --st-ink-900: #ffffff;
+  --st-ink-850: #f1f4f9;
+  --st-ink-800: #e6eaf2;
+  --st-ink-700: #dfe4ee;
+  --st-ink-600: #c6cede;
+  --st-ink-500: #6b7c9e;
+  --st-mist-100: #0d1728;
+  --st-mist-200: #16233d;
+  --st-mist-300: #3a4d70;
+  --st-mist-400: #64748b;
+  --st-teal-accent: #0f766e;
+  --st-cyan-accent: #0e7490;
+  --st-jade-accent: #0f8a5f;
+
+  --st-ok: #15803d;
+  --st-ok-soft: #dcfce7;
+  --st-warn: #b45309;
+  --st-warn-soft: #fef3c7;
+  --st-info: #0e7490;
+  --st-info-soft: #cffafe;
+  --st-err: #b91c1c;
+  --st-err-soft: #fee2e2;
+  --st-muted: #4b5b74;
+  --st-muted-soft: #edf1f7;
+
+  --st-spk-1: #0e7490;
+  --st-spk-2: #0f8a5f;
+  --st-spk-3: #6d4aab;
+
+  color-scheme: light;
 }
 
 html,
@@ -58,4 +157,58 @@ textarea {
 
 button {
   @apply cursor-pointer select-none;
+}
+
+/* Markdown 纪要排版（未安装 typography 插件，prose-* 不生效，故显式定义） */
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+  @apply text-mist-100 font-semibold;
+}
+.md-body h1 {
+  @apply text-lg mt-1 mb-3;
+}
+.md-body h2 {
+  @apply text-base mt-5 mb-2;
+}
+.md-body h3 {
+  @apply text-sm mt-4 mb-1.5;
+}
+.md-body p {
+  @apply my-2 leading-relaxed;
+}
+.md-body ul,
+.md-body ol {
+  @apply my-2 pl-5 space-y-1;
+}
+.md-body ul {
+  @apply list-disc;
+}
+.md-body ol {
+  @apply list-decimal;
+}
+.md-body strong {
+  @apply text-mist-100 font-semibold;
+}
+.md-body a {
+  @apply text-cyan-accent underline;
+}
+.md-body code {
+  @apply px-1 py-0.5 rounded bg-ink-850 text-mist-200 text-[0.9em];
+}
+.md-body table {
+  @apply my-3 w-full border-collapse text-xs;
+}
+.md-body th,
+.md-body td {
+  @apply border border-ink-700 px-2 py-1.5 text-left align-top;
+}
+.md-body th {
+  @apply bg-ink-850 text-mist-100 font-medium;
+}
+.md-body blockquote {
+  @apply my-2 pl-3 border-l-2 border-ink-700 text-mist-400;
+}
+.md-body hr {
+  @apply my-4 border-ink-800;
 }

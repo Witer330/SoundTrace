@@ -52,10 +52,12 @@ function Sidebar() {
 export default function App() {
   const view = useAppStore((s) => s.view);
   const refresh = useAppStore((s) => s.refreshRecordings);
+  const initTheme = useAppStore((s) => s.initTheme);
 
   useEffect(() => {
+    initTheme();
     void refresh();
-  }, [refresh]);
+  }, [initTheme, refresh]);
 
   // 转写任务状态变化时刷新库列表（列表页也能看到状态流转）
   useEffect(() => {

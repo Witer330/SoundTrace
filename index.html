@@ -4,9 +4,29 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>声迹 SoundTrace</title>
+    <script>
+      // 首帧前定主题，避免浅色主题下先闪一屏深色（与 src/store.ts 的 THEME_KEY 一致）
+      (function () {
+        var mode = localStorage.getItem("st.theme") || "system";
+        var dark =
+          mode === "dark" ||
+          (mode === "system" &&
+            !window.matchMedia("(prefers-color-scheme: light)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        document.documentElement.style.colorScheme = dark ? "dark" : "light";
+      })();
+    </script>
     <style>
-      /* 避免 WebView 初始化前的白屏闪烁 */
-      html, body { background: #0b1220; }
+      /* 避免 WebView 初始化前的白屏闪烁；浅色主题下由 data-theme 覆盖 */
+      html,
+      body {
+        background: #0b1220;
+        margin: 0;
+      }
+      html[data-theme="light"],
+      html[data-theme="light"] body {
+        background: #f4f6fb;
+      }
     </style>
   </head>
 

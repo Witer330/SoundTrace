@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { useAppStore } from "../store";
 
 interface WaveformProps {
   peaks: number[];
@@ -6,6 +7,23 @@ interface WaveformProps {
   currentTime: number;
   onSeek: (sec: number) => void;
   height?: number;
+}
+
+/** 变量名与 styles.css 的令牌对应；Canvas 取不到 CSS 继承色，只能运行时读变量 */
+const COLOR_VARS = {
+  idle: "--color-ink-700",
+  played: "--color-cyan-accent",
+  unplayed: "--color-ink-600",
+  playhead: "--color-teal-accent",
+} as const;
+
+function readColors(el: Element): Record<keyof typeof COLOR_VARS, string> {
+  const cs = getComputedStyle(el);
+  const out = {} as Record<keyof typeof COLOR_VARS, string>;
+  for (const [key, name] of Object.entries(COLOR_VARS)) {
+    out[key as keyof typeof COLOR_VARS] = cs.getPropertyValue(name).trim();
+  }
+  return out;
 }
 
 /**
@@ -21,6 +39,8 @@ export default function Waveform({
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draggingRef = useRef(false);
+  // 主题变化时重绘（暂停状态下 currentTime 不变，否则波形会停在旧配色）
+  const theme = useAppStore((s) => s.theme);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -42,9 +62,10 @@ export default function Waveform({
     const mid = cssH / 2;
     const progress = durationSec > 0 ? Math.min(currentTime / durationSec, 1) : 0;
     const progressX = progress * cssW;
+    const colors = readColors(canvas);
 
     if (peaks.length === 0) {
-      ctx.fillStyle = "#24365c";
+      ctx.fillStyle = colors.idle;
       ctx.fillRect(0, mid - 1, cssW, 2);
       return;
     }
@@ -59,14 +80,14 @@ export default function Waveform({
       }
       // 平方根缩放，让小音量也可见
       const amp = Math.max(1.5, Math.sqrt(peak) * (cssH / 2 - 4));
-      ctx.fillStyle = x <= progressX ? "#22d3ee" : "#324673";
+      ctx.fillStyle = x <= progressX ? colors.played : colors.unplayed;
       ctx.fillRect(x, mid - amp, 1, amp * 2);
     }
 
     // 播放头
-    ctx.fillStyle = "#5eead4";
+    ctx.fillStyle = colors.playhead;
     ctx.fillRect(progressX - 0.5, 0, 1.5, cssH);
-  }, [peaks, durationSec, currentTime, height]);
+  }, [peaks, durationSec, currentTime, height, theme]);
 
   useEffect(() => {
     draw();
