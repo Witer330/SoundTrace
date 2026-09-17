@@ -76,7 +76,9 @@ export interface RecordingPatch {
 }
 
 export type View =
+  | { kind: "workbench" }
   | { kind: "library" }
+  | { kind: "search" }
   | { kind: "detail"; id: number; seekMs?: number }
   | { kind: "settings" };
 

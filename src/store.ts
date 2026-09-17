@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import type { Recording, View } from "./types";
-import { isTauri, listRecordings } from "./api";
+import { isTauri, listJobs, listRecordings, type JobRow } from "./api";
 
 export type ThemeMode = "system" | "light" | "dark";
 export type Theme = "light" | "dark";
@@ -28,30 +28,35 @@ interface AppState {
   view: View;
   recordings: Recording[];
   recordingsLoaded: boolean;
+  jobs: JobRow[];
   libraryQuery: string;
   theme: Theme;
   themeMode: ThemeMode;
   go: (view: View) => void;
   setLibraryQuery: (q: string) => void;
   refreshRecordings: () => Promise<void>;
+  refreshJobs: () => Promise<void>;
+  /** 录音列表 + 队列一起刷新（工作台与库列表共用） */
+  refreshAll: () => Promise<void>;
   initTheme: () => void;
   setThemeMode: (mode: ThemeMode) => void;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
-  view: { kind: "library" },
+  view: { kind: "workbench" },
   recordings: [],
   recordingsLoaded: false,
+  jobs: [],
   libraryQuery: "",
   theme: "dark",
   themeMode: "system",
 
   go: (view) => {
     set({ view });
-    if (view.kind === "library") {
-      // 从详情返回时刷新列表（元数据可能被修改过）
+    // 进入列表类视图时刷新（详情页可能改过元数据、队列可能已推进）
+    if (view.kind === "library" || view.kind === "workbench" || view.kind === "search") {
       set((s) => {
-        if (s.recordingsLoaded) void s.refreshRecordings();
+        if (s.recordingsLoaded) void s.refreshAll();
         return s;
       });
     }
@@ -71,6 +76,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch {
       // 后端未就绪时保持现状，由调用方决定是否提示
     }
+  },
+
+  refreshJobs: async () => {
+    if (!isTauri()) return;
+    try {
+      set({ jobs: await listJobs(false) });
+    } catch {
+      // 忽略：队列面板允许为空
+    }
+  },
+
+  refreshAll: async () => {
+    await Promise.all([get().refreshRecordings(), get().refreshJobs()]);
   },
 
   initTheme: () => {
@@ -94,6 +112,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ themeMode: mode, theme });
   },
 }));
+
+/** 队列中的活跃任务（worker 串行，至多一个 running） */
+export function selectActiveJob(s: AppState): JobRow | undefined {
+  return s.jobs.find((j) => j.status === "running") ?? s.jobs.find((j) => j.status === "pending");
+}
+
+/** 待处理数：排队中 + 转写中 */
+export function selectPendingCount(s: AppState): number {
+  return s.jobs.filter((j) => j.status === "pending" || j.status === "running").length;
+}
 
 // 调试与端到端验证用：在浏览器控制台里可直接切换视图/主题
 if (import.meta.env.DEV) {

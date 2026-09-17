@@ -322,29 +322,105 @@ fn transcribe(app: tauri::AppHandle, state: State<AppState>, recording_id: i64) 
     Ok(job_id)
 }
 
-/// 取消该录音正在进行的转写
+/// 取消该录音的转写（排队中的直接出队，正在跑的下一次进度检查点退出）
 #[tauri::command]
-fn cancel_transcribe(state: State<AppState>, recording_id: i64) -> AppResult<()> {
+fn cancel_transcribe(app: tauri::AppHandle, state: State<AppState>, recording_id: i64) -> AppResult<()> {
     state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let conn = state.db.conn.lock().unwrap();
-    conn.execute(
+    let affected = conn.execute(
         "UPDATE jobs SET status='canceled', updated_at=?1
          WHERE recording_id=?2 AND kind='transcribe' AND status IN ('pending','running')",
         rusqlite::params![now, recording_id],
     )?;
+    if affected > 0 {
+        // 回写录音状态，否则队列里取消一条会一直显示「排队中」；
+        // 若该录音此刻已是 done（取消与 worker 完成竞争），不要把它降级回 imported
+        conn.execute(
+            "UPDATE recordings SET status='imported', updated_at=?1
+             WHERE id=?2 AND status IN ('queued','transcribing')",
+            rusqlite::params![now, recording_id],
+        )?;
+    }
+    drop(conn);
+    if affected > 0 {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "job://progress",
+            transcribe::JobEvent {
+                recording_id,
+                status: "canceled".into(),
+                progress: 0.0,
+                error: String::new(),
+            },
+        );
+    }
     Ok(())
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JobInfo {
-    id: i64,
-    recording_id: Option<i64>,
-    kind: String,
-    status: String,
-    progress: f64,
-    error: Option<String>,
+pub struct JobInfo {
+    pub id: i64,
+    pub recording_id: Option<i64>,
+    pub kind: String,
+    pub status: String,
+    pub progress: f64,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// 关联录音标题（工作台队列要显示「哪条录音」）
+    pub title: Option<String>,
+    pub duration_sec: f64,
+}
+
+/// 队列快照：工作台展示「正在转写 / 排队中 / 最近完成」。
+/// 排序把 running 置顶、pending 次之，其余按更新时间倒序 —— 与 worker 的 FIFO 取件一致。
+pub fn query_jobs(db: &db::Db, active_only: bool) -> AppResult<Vec<JobInfo>> {
+    let conn = db.conn.lock().unwrap();
+    let filter = if active_only {
+        "AND j.status IN ('pending','running')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT j.id, j.recording_id, j.kind, j.status, j.progress, j.error,
+                j.created_at, j.updated_at, r.title, r.duration_sec
+         FROM jobs j
+         LEFT JOIN recordings r ON r.id = j.recording_id
+         WHERE 1=1 {filter}
+         ORDER BY CASE j.status
+                    WHEN 'running' THEN 0
+                    WHEN 'pending' THEN 1
+                    ELSE 2
+                  END,
+                  j.updated_at DESC,
+                  j.id DESC
+         LIMIT 200"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(JobInfo {
+                id: r.get(0)?,
+                recording_id: r.get(1)?,
+                kind: r.get(2)?,
+                status: r.get(3)?,
+                progress: r.get(4)?,
+                error: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+                title: r.get(8)?,
+                duration_sec: r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[tauri::command]
+fn list_jobs(state: State<AppState>, active_only: bool) -> AppResult<Vec<JobInfo>> {
+    query_jobs(&state.db, active_only)
 }
 
 #[tauri::command]
@@ -352,9 +428,12 @@ fn get_job(state: State<AppState>, recording_id: i64) -> AppResult<Option<JobInf
     let conn = state.db.conn.lock().unwrap();
     let v = conn
         .query_row(
-            "SELECT id, recording_id, kind, status, progress, error FROM jobs
-             WHERE recording_id=?1 AND kind='transcribe'
-             ORDER BY id DESC LIMIT 1",
+            "SELECT j.id, j.recording_id, j.kind, j.status, j.progress, j.error,
+                    j.created_at, j.updated_at, r.title, r.duration_sec
+             FROM jobs j
+             LEFT JOIN recordings r ON r.id = j.recording_id
+             WHERE j.recording_id=?1 AND j.kind='transcribe'
+             ORDER BY j.id DESC LIMIT 1",
             [recording_id],
             |r| {
                 Ok(JobInfo {
@@ -364,6 +443,10 @@ fn get_job(state: State<AppState>, recording_id: i64) -> AppResult<Option<JobInf
                     status: r.get(3)?,
                     progress: r.get(4)?,
                     error: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                    title: r.get(8)?,
+                    duration_sec: r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                 })
             },
         )
@@ -457,6 +540,7 @@ pub fn run() {
             transcribe,
             cancel_transcribe,
             get_job,
+            list_jobs,
             search_all,
             generate_summary,
             test_llm,

@@ -144,6 +144,25 @@ export interface JobEvent {
   error: string;
 }
 
+/** 队列快照行（jobs JOIN recordings） */
+export interface JobRow {
+  id: number;
+  recordingId: number | null;
+  kind: string;
+  status: "pending" | "running" | "done" | "failed" | "canceled";
+  progress: number;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  title: string | null;
+  durationSec: number;
+}
+
+/** 队列快照：activeOnly 只取排队中/进行中 */
+export async function listJobs(activeOnly = false): Promise<JobRow[]> {
+  return invoke("list_jobs", { activeOnly });
+}
+
 export interface ModelDownloadProgress {
   modelId: string;
   bytes: number;

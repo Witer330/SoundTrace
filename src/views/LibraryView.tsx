@@ -1,69 +1,121 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { errMsg, importPaths, isTauri, searchAll, type SearchResults } from "../api";
+import {
+  cancelTranscribe,
+  errMsg,
+  importPaths,
+  isTauri,
+  transcribeRecording,
+  type JobRow,
+} from "../api";
 import { useAppStore } from "../store";
 import {
   formatBytes,
-  formatDate,
   formatDateTime,
   formatDuration,
-  formatMsTime,
-  STATUS_LABEL,
   type ImportResult,
   type Recording,
-  type RecordingStatus,
 } from "../types";
+import StatusBadge from "../components/StatusBadge";
 
-function StatusBadge({ status }: { status: RecordingStatus }) {
-  const style: Record<RecordingStatus, string> = {
-    imported: "bg-st-muted-soft text-st-muted",
-    queued: "bg-st-warn-soft text-st-warn",
-    transcribing: "bg-st-info-soft text-st-info animate-pulse",
-    done: "bg-st-ok-soft text-st-ok",
-    failed: "bg-st-err-soft text-st-err",
-  };
+/** 该录音是否有排队中/进行中的任务 */
+function isActive(r: Recording, jobs: JobRow[]): boolean {
+  return jobs.some(
+    (j) => j.recordingId === r.id && (j.status === "pending" || j.status === "running"),
+  );
+}
+
+function RecordingRow({
+  rec,
+  job,
+  selected,
+  onToggle,
+  onOpen,
+}: {
+  rec: Recording;
+  job?: JobRow;
+  selected: boolean;
+  onToggle: () => void;
+  onOpen: () => void;
+}) {
+  const progress = job?.status === "running" ? job.progress : null;
   return (
-    <span className={`px-2 py-0.5 rounded text-xs ${style[status]}`}>
-      {STATUS_LABEL[status]}
-    </span>
+    <div
+      className={`group flex items-center gap-3 px-3 py-2.5 rounded-xl border transition-colors cursor-pointer ${
+        selected
+          ? "bg-ink-850 border-cyan-accent/50"
+          : "bg-ink-900 border-ink-800 hover:border-ink-600 hover:bg-ink-850"
+      }`}
+      onClick={onOpen}
+    >
+      <label
+        className="shrink-0 grid place-items-center w-5 h-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <input
+          type="checkbox"
+          className="w-4 h-4 accent-[var(--color-cyan-accent)] cursor-pointer"
+          checked={selected}
+          onChange={onToggle}
+        />
+      </label>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-mist-200 truncate">{rec.title}</span>
+          <StatusBadge status={rec.status} />
+          {rec.summaryMd && <span className="text-[11px] text-st-ok shrink-0">有纪要</span>}
+        </div>
+        <div className="text-[11px] text-ink-500 mt-1 flex gap-3 flex-wrap items-center">
+          <span className="tabular-nums">{formatDateTime(rec.recordedAt)}</span>
+          <span className="tabular-nums">{formatDuration(rec.durationSec)}</span>
+          <span>{formatBytes(rec.sizeBytes)}</span>
+          <span className="uppercase">{rec.format}</span>
+          {rec.participants && <span className="truncate max-w-[140px]">{rec.participants}</span>}
+        </div>
+        {progress !== null && (
+          <div className="mt-1.5 flex items-center gap-2">
+            <div className="flex-1 max-w-[200px] h-1 rounded-full bg-ink-800 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-teal-accent to-cyan-accent transition-all"
+                style={{ width: `${Math.round(progress * 100)}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-ink-500 tabular-nums">
+              {Math.round(progress * 100)}%
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-1.5 shrink-0 max-w-[220px]">
+        {rec.tags.slice(0, 4).map((t) => (
+          <span key={t} className="px-2 py-0.5 rounded-full bg-ink-800 text-ink-500 text-[11px]">
+            {t}
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 
 export default function LibraryView() {
   const recordings = useAppStore((s) => s.recordings);
   const loaded = useAppStore((s) => s.recordingsLoaded);
-  const query = useAppStore((s) => s.libraryQuery);
-  const setQuery = useAppStore((s) => s.setLibraryQuery);
+  const jobs = useAppStore((s) => s.jobs);
   const go = useAppStore((s) => s.go);
-  const refresh = useAppStore((s) => s.refreshRecordings);
+  const refreshAll = useAppStore((s) => s.refreshAll);
 
   const [dragging, setDragging] = useState(false);
   const [importing, setImporting] = useState(false);
   const [lastResult, setLastResult] = useState<ImportResult | null>(null);
-  const [searchResults, setSearchResults] = useState<SearchResults | null>(null);
+  const [filter, setFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "pending" | "done" | "failed">("all");
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchMsg, setBatchMsg] = useState("");
   const dragDepth = useRef(0);
-
-  // 全局搜索（防抖 350ms；清空回到列表）
-  useEffect(() => {
-    const q = query.trim();
-    if (!q) {
-      setSearchResults(null);
-      return;
-    }
-    const timer = setTimeout(() => {
-      if (!isTauri()) return;
-      searchAll(q)
-        .then(setSearchResults)
-        .catch((e) => setErrorSearch(errMsg(e)));
-    }, 350);
-    return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query]);
-
-  function setErrorSearch(msg: string) {
-    setLastResult({ imported: [], skipped: [{ path: "", reason: msg }] });
-  }
 
   async function doImport(paths: string[] | null) {
     if (!paths || paths.length === 0) return;
@@ -71,7 +123,7 @@ export default function LibraryView() {
     try {
       const result = await importPaths(paths);
       setLastResult(result);
-      await refresh();
+      await refreshAll();
     } catch (e) {
       setLastResult({ imported: [], skipped: [{ path: "", reason: errMsg(e) }] });
     } finally {
@@ -82,7 +134,12 @@ export default function LibraryView() {
   async function pickFiles() {
     const paths = await open({
       multiple: true,
-      filters: [{ name: "音频", extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"] }],
+      filters: [
+        {
+          name: "音频",
+          extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"],
+        },
+      ],
     });
     await doImport(Array.isArray(paths) ? paths : paths ? [paths] : null);
   }
@@ -115,68 +172,123 @@ export default function LibraryView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const q = query.trim();
-  const filtered = !q
-    ? recordings
-    : (searchResults?.recordings ?? []).map((hit) =>
-        recordings.find((r) => r.id === hit.id),
-      ).filter((r): r is Recording => !!r);
+  // 筛选后的列表
+  const visible = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return recordings.filter((r) => {
+      if (statusFilter === "pending" && r.status !== "imported" && r.status !== "queued" && r.status !== "transcribing")
+        return false;
+      if (statusFilter === "done" && r.status !== "done") return false;
+      if (statusFilter === "failed" && r.status !== "failed") return false;
+      if (!q) return true;
+      return (
+        r.title.toLowerCase().includes(q) ||
+        r.tags.some((t) => t.toLowerCase().includes(q)) ||
+        r.participants.toLowerCase().includes(q) ||
+        r.notes.toLowerCase().includes(q)
+      );
+    });
+  }, [recordings, filter, statusFilter]);
 
-  // 搜索结果：命中录音 + 命中转写片段
-  const searchSection =
-    q && searchResults ? (
-      <div className="space-y-4">
-        {searchResults.segments.length > 0 && (
-          <div className="space-y-2">
-            <div className="text-xs text-ink-500">
-              转写片段命中 {searchResults.segments.length} 条
-            </div>
-            {searchResults.segments.map((seg, i) => (
-              <button
-                key={i}
-                onClick={() => go({ kind: "detail", id: seg.recordingId, seekMs: seg.startMs })}
-                className="w-full text-left px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 transition-colors"
-              >
-                <div className="flex items-center gap-2 text-xs text-ink-500">
-                  <span className="text-cyan-accent tabular-nums">{formatMsTime(seg.startMs)}</span>
-                  <span className="truncate">{seg.recordingTitle}</span>
-                  <span>·</span>
-                  <span>{formatDate(seg.recordedAt)}</span>
-                </div>
-                <div className="text-sm text-mist-300 mt-1 line-clamp-2">{seg.snippet}</div>
-              </button>
-            ))}
-          </div>
-        )}
-        {searchResults.recordings.length === 0 && searchResults.segments.length === 0 && (
-          <div className="text-center text-mist-400 text-sm py-12">
-            没有找到与「{q}」相关的内容
-          </div>
-        )}
-      </div>
-    ) : null;
+  const jobOf = (id: number) =>
+    jobs.find((j) => j.recordingId === id && (j.status === "pending" || j.status === "running"));
+
+  const selectedRecs = visible.filter((r) => selected.has(r.id));
+  const selectedTodo = selectedRecs.filter((r) => !isActive(r, jobs));
+
+  function toggle(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  /** 批量排队转写；已有任务在跑的已在 selectedTodo 里排除 */
+  async function batchTranscribe() {
+    if (selectedTodo.length === 0) return;
+    setBatchBusy(true);
+    setBatchMsg("");
+    let queued = 0;
+    const failed: string[] = [];
+    for (const r of selectedTodo) {
+      try {
+        await transcribeRecording(r.id);
+        queued += 1;
+      } catch (e) {
+        failed.push(errMsg(e));
+      }
+    }
+    await refreshAll();
+    setBatchBusy(false);
+    setBatchMsg(
+      `已排队 ${queued} 条${failed.length ? ` · ${failed.length} 条未加入（${failed[0] ?? ""}）` : ""}`,
+    );
+    setSelected(new Set());
+  }
+
+  async function batchCancel() {
+    setBatchBusy(true);
+    setBatchMsg("");
+    let n = 0;
+    for (const r of selectedRecs.filter((r) => isActive(r, jobs))) {
+      try {
+        await cancelTranscribe(r.id);
+        n += 1;
+      } catch {
+        // 忽略单条失败
+      }
+    }
+    await refreshAll();
+    setBatchBusy(false);
+    setBatchMsg(`已取消 ${n} 条排队任务`);
+    setSelected(new Set());
+  }
 
   return (
     <div className="h-full flex flex-col relative">
       {/* 工具栏 */}
-      <div className="flex items-center gap-2 px-4 h-14 border-b border-ink-800 bg-ink-900/60">
+      <div className="flex items-center gap-2 px-4 h-14 border-b border-ink-800 bg-ink-900/60 shrink-0">
         <input
           type="text"
-          className="flex-1 max-w-md"
-          placeholder="搜索标题或标签…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          className="flex-1 max-w-xs"
+          placeholder="按标题/标签/参会人筛选…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
         />
+        <div className="flex gap-1">
+          {(
+            [
+              ["all", "全部"],
+              ["pending", "待处理"],
+              ["done", "已转写"],
+              ["failed", "失败"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setStatusFilter(key)}
+              className={`px-2.5 py-1 rounded-lg text-xs transition-colors ${
+                statusFilter === key
+                  ? "bg-ink-700 text-mist-100"
+                  : "text-mist-400 hover:bg-ink-850 hover:text-mist-300"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="flex-1" />
         <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 transition-colors"
+          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 transition-colors disabled:opacity-50 shrink-0"
           onClick={pickFiles}
           disabled={importing}
         >
           导入文件
         </button>
         <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium hover:opacity-90 transition-opacity"
+          className="px-3 py-1.5 rounded-lg text-sm bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium hover:opacity-90 transition-opacity disabled:opacity-50 shrink-0"
           onClick={pickFolder}
           disabled={importing}
         >
@@ -184,56 +296,69 @@ export default function LibraryView() {
         </button>
       </div>
 
-      {/* 导入结果提示 */}
-      {lastResult && (
-        <div className="mx-4 mt-3 px-3 py-2 rounded-lg bg-ink-850 border border-ink-700 text-sm flex items-start gap-2">
+      {/* 提示条 */}
+      {(lastResult || batchMsg) && (
+        <div className="mx-4 mt-3 px-3 py-2 rounded-lg bg-ink-850 border border-ink-700 text-sm flex items-start gap-2 shrink-0">
           <div className="flex-1 text-mist-300">
-            导入完成：新增 {lastResult.imported.length} 条
-            {lastResult.skipped.length > 0 && (
-              <span className="text-mist-400">
-                {" "}· 跳过 {lastResult.skipped.length} 条
-                （{lastResult.skipped.map((s) => s.reason).join("；").slice(0, 120)}）
-              </span>
+            {lastResult && (
+              <>
+                导入完成：新增 {lastResult.imported.length} 条
+                {lastResult.skipped.length > 0 && (
+                  <span className="text-mist-400">
+                    {" "}
+                    · 跳过 {lastResult.skipped.length} 条（
+                    {lastResult.skipped.map((s) => s.reason).join("；").slice(0, 100)}）
+                  </span>
+                )}
+              </>
             )}
+            {batchMsg && <span className={lastResult ? "ml-2 text-mist-400" : ""}>{batchMsg}</span>}
           </div>
-          <button className="text-ink-500 hover:text-mist-300" onClick={() => setLastResult(null)}>
+          <button
+            className="text-ink-500 hover:text-mist-300"
+            onClick={() => {
+              setLastResult(null);
+              setBatchMsg("");
+            }}
+          >
             ✕
           </button>
         </div>
       )}
 
+      {/* 全选行 */}
+      {visible.length > 0 && (
+        <div className="flex items-center gap-3 px-5 pt-3 pb-1 shrink-0">
+          <label className="flex items-center gap-2 text-xs text-mist-400 cursor-pointer">
+            <input
+              type="checkbox"
+              className="w-4 h-4 accent-[var(--color-cyan-accent)] cursor-pointer"
+              checked={selected.size > 0 && selected.size === visible.length}
+              onChange={(e) =>
+                setSelected(e.target.checked ? new Set(visible.map((r) => r.id)) : new Set())
+              }
+            />
+            全选
+          </label>
+          <span className="text-xs text-ink-500">
+            共 {visible.length} 条{filter || statusFilter !== "all" ? "（已筛选）" : ""}
+          </span>
+          {selected.size > 0 && (
+            <button
+              className="text-xs text-mist-400 hover:text-mist-200"
+              onClick={() => setSelected(new Set())}
+            >
+              取消选择
+            </button>
+          )}
+        </div>
+      )}
+
       {/* 列表 */}
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto p-4 pt-2 space-y-2">
         {!loaded ? (
           <div className="text-mist-400 text-sm">加载中…</div>
-        ) : searchSection ? (
-          <>
-            {searchSection}
-            {filtered.length > 0 && (
-              <div className="space-y-2 mt-4">
-                <div className="text-xs text-ink-500">录音命中 {filtered.length} 条</div>
-                {filtered.map((r) => (
-                  <button
-                    key={r.id}
-                    onClick={() => go({ kind: "detail", id: r.id })}
-                    className="w-full flex items-center gap-4 px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors text-left"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-mist-200 truncate">{r.title}</span>
-                        <StatusBadge status={r.status} />
-                      </div>
-                      <div className="text-xs text-ink-500 mt-1 flex gap-3 flex-wrap">
-                        <span>{formatDateTime(r.recordedAt)}</span>
-                        <span>{formatDuration(r.durationSec)}</span>
-                      </div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
-        ) : filtered.length === 0 ? (
+        ) : visible.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
             <svg width="88" height="88" viewBox="0 0 1024 1024" className="opacity-70">
               <rect width="1024" height="1024" rx="230" className="fill-ink-850" />
@@ -258,52 +383,67 @@ export default function LibraryView() {
               />
               <circle cx="856" cy="742" r="30" className="fill-jade-accent" />
             </svg>
-            <div className="text-mist-300">录音库还是空的</div>
+            <div className="text-mist-300">
+              {recordings.length === 0 ? "录音库还是空的" : "没有符合条件的录音"}
+            </div>
             <div className="text-mist-400 text-sm">
-              把手机录音（文件或整个文件夹）拖到这里，或点击右上角导入
+              {recordings.length === 0
+                ? "把手机录音（文件或整个文件夹）拖到这里，或点击右上角导入"
+                : "换个关键词或状态筛选试试"}
             </div>
           </div>
         ) : (
-          <div className="space-y-2">
-            {filtered.map((r) => (
-              <button
-                key={r.id}
-                onClick={() => go({ kind: "detail", id: r.id })}
-                className="w-full flex items-center gap-4 px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors text-left"
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-mist-200 truncate">{r.title}</span>
-                    <StatusBadge status={r.status} />
-                  </div>
-                  <div className="text-xs text-ink-500 mt-1 flex gap-3 flex-wrap">
-                    <span>{formatDateTime(r.recordedAt)}</span>
-                    <span>{formatDuration(r.durationSec)}</span>
-                    <span>{formatBytes(r.sizeBytes)}</span>
-                    <span className="uppercase">{r.format}</span>
-                  </div>
-                </div>
-                <div className="flex gap-1.5 shrink-0">
-                  {r.tags.slice(0, 4).map((t) => (
-                    <span
-                      key={t}
-                      className="px-2 py-0.5 rounded-full bg-ink-800 text-ink-500 text-xs"
-                    >
-                      {t}
-                    </span>
-                  ))}
-                </div>
-              </button>
-            ))}
-          </div>
+          visible.map((r) => (
+            <RecordingRow
+              key={r.id}
+              rec={r}
+              job={jobOf(r.id)}
+              selected={selected.has(r.id)}
+              onToggle={() => toggle(r.id)}
+              onOpen={() => go({ kind: "detail", id: r.id })}
+            />
+          ))
         )}
       </div>
+
+      {/* 批量操作条 */}
+      {selected.size > 0 && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-ink-850 border border-ink-700 shadow-xl">
+          <span className="text-sm text-mist-300 mr-1">已选 {selected.size} 条</span>
+          <button
+            className="px-3 py-1.5 rounded-lg text-sm bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium hover:opacity-90 disabled:opacity-50"
+            onClick={batchTranscribe}
+            disabled={batchBusy || selectedTodo.length === 0}
+            title={
+              selectedTodo.length === 0
+                ? "所选录音都已有进行中的任务"
+                : `排队转写 ${selectedTodo.length} 条`
+            }
+          >
+            {batchBusy ? "处理中…" : `批量转写（${selectedTodo.length}）`}
+          </button>
+          <button
+            className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 disabled:opacity-50"
+            onClick={batchCancel}
+            disabled={batchBusy || selectedRecs.filter((r) => isActive(r, jobs)).length === 0}
+          >
+            取消排队
+          </button>
+          <button
+            className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"
+            onClick={() => setSelected(new Set())}
+          >
+            取消选择
+          </button>
+        </div>
+      )}
 
       {/* 拖拽遮罩 */}
       {dragging && (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-ink-950/60 backdrop-blur-sm">
           <div className="border-2 border-dashed border-cyan-accent/50 rounded-2xl px-16 py-12 text-center">
-            <div className="text-cyan-accent text-lg">松手导入录音</div>            <div className="text-mist-400 text-sm mt-1">支持文件或文件夹（递归扫描）</div>
+            <div className="text-cyan-accent text-lg">松手导入录音</div>
+            <div className="text-mist-400 text-sm mt-1">支持文件或文件夹（递归扫描）</div>
           </div>
         </div>
       )}
