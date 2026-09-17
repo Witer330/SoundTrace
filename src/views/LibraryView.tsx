@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { errMsg, importPaths, isTauri } from "../api";
+import { errMsg, importPaths, isTauri, searchAll, type SearchResults } from "../api";
 import { useAppStore } from "../store";
 import {
   formatBytes,
+  formatDate,
   formatDateTime,
   formatDuration,
+  formatMsTime,
   STATUS_LABEL,
   type ImportResult,
+  type Recording,
   type RecordingStatus,
 } from "../types";
 
@@ -38,7 +41,29 @@ export default function LibraryView() {
   const [dragging, setDragging] = useState(false);
   const [importing, setImporting] = useState(false);
   const [lastResult, setLastResult] = useState<ImportResult | null>(null);
+  const [searchResults, setSearchResults] = useState<SearchResults | null>(null);
   const dragDepth = useRef(0);
+
+  // 全局搜索（防抖 350ms；清空回到列表）
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setSearchResults(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (!isTauri()) return;
+      searchAll(q)
+        .then(setSearchResults)
+        .catch((e) => setErrorSearch(errMsg(e)));
+    }, 350);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query]);
+
+  function setErrorSearch(msg: string) {
+    setLastResult({ imported: [], skipped: [{ path: "", reason: msg }] });
+  }
 
   async function doImport(paths: string[] | null) {
     if (!paths || paths.length === 0) return;
@@ -90,13 +115,46 @@ export default function LibraryView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const filtered = query.trim()
-    ? recordings.filter(
-        (r) =>
-          r.title.toLowerCase().includes(query.toLowerCase()) ||
-          r.tags.some((t) => t.toLowerCase().includes(query.toLowerCase())),
-      )
-    : recordings;
+  const q = query.trim();
+  const filtered = !q
+    ? recordings
+    : (searchResults?.recordings ?? []).map((hit) =>
+        recordings.find((r) => r.id === hit.id),
+      ).filter((r): r is Recording => !!r);
+
+  // 搜索结果：命中录音 + 命中转写片段
+  const searchSection =
+    q && searchResults ? (
+      <div className="space-y-4">
+        {searchResults.segments.length > 0 && (
+          <div className="space-y-2">
+            <div className="text-xs text-ink-500">
+              转写片段命中 {searchResults.segments.length} 条
+            </div>
+            {searchResults.segments.map((seg, i) => (
+              <button
+                key={i}
+                onClick={() => go({ kind: "detail", id: seg.recordingId, seekMs: seg.startMs })}
+                className="w-full text-left px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 transition-colors"
+              >
+                <div className="flex items-center gap-2 text-xs text-ink-500">
+                  <span className="text-cyan-accent tabular-nums">{formatMsTime(seg.startMs)}</span>
+                  <span className="truncate">{seg.recordingTitle}</span>
+                  <span>·</span>
+                  <span>{formatDate(seg.recordedAt)}</span>
+                </div>
+                <div className="text-sm text-mist-300 mt-1 line-clamp-2">{seg.snippet}</div>
+              </button>
+            ))}
+          </div>
+        )}
+        {searchResults.recordings.length === 0 && searchResults.segments.length === 0 && (
+          <div className="text-center text-mist-400 text-sm py-12">
+            没有找到与「{q}」相关的内容
+          </div>
+        )}
+      </div>
+    ) : null;
 
   return (
     <div className="h-full flex flex-col relative">
@@ -148,6 +206,33 @@ export default function LibraryView() {
       <div className="flex-1 overflow-y-auto p-4">
         {!loaded ? (
           <div className="text-mist-400 text-sm">加载中…</div>
+        ) : searchSection ? (
+          <>
+            {searchSection}
+            {filtered.length > 0 && (
+              <div className="space-y-2 mt-4">
+                <div className="text-xs text-ink-500">录音命中 {filtered.length} 条</div>
+                {filtered.map((r) => (
+                  <button
+                    key={r.id}
+                    onClick={() => go({ kind: "detail", id: r.id })}
+                    className="w-full flex items-center gap-4 px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors text-left"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-mist-200 truncate">{r.title}</span>
+                        <StatusBadge status={r.status} />
+                      </div>
+                      <div className="text-xs text-ink-500 mt-1 flex gap-3 flex-wrap">
+                        <span>{formatDateTime(r.recordedAt)}</span>
+                        <span>{formatDuration(r.durationSec)}</span>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
         ) : filtered.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
             <svg width="88" height="88" viewBox="0 0 1024 1024" className="opacity-60">

@@ -77,7 +77,7 @@ export interface RecordingPatch {
 
 export type View =
   | { kind: "library" }
-  | { kind: "detail"; id: number }
+  | { kind: "detail"; id: number; seekMs?: number }
   | { kind: "settings" };
 
 export function formatDuration(sec: number): string {

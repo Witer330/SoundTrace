@@ -1,13 +1,20 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import {
   changeDataRoot,
+  downloadModels,
   errMsg,
   getAppInfo,
   getSettings,
+  modelsStatus,
   setSettings,
+  testLlm,
+  type ModelDownloadProgress,
+  type ModelStatus,
 } from "../api";
 import type { AppInfo } from "../types";
+import { formatBytes } from "../types";
 
 function Card({
   title,
@@ -29,6 +36,108 @@ function Card({
   );
 }
 
+/** 模型管理卡片 */
+function ModelsCard() {
+  const [statuses, setStatuses] = useState<ModelStatus[]>([]);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState<Record<string, ModelDownloadProgress>>({});
+  const [error, setError] = useState("");
+
+  function refresh() {
+    modelsStatus().then(setStatuses).catch((e) => setError(errMsg(e)));
+  }
+
+  useEffect(() => {
+    refresh();
+    const p = listen<ModelDownloadProgress>("models://progress", (e) => {
+      setProgress((prev) => ({ ...prev, [e.payload.modelId]: e.payload }));
+    });
+    const d = listen<{ ok: boolean; error: string }>("models://done", (e) => {
+      setDownloading(false);
+      setProgress({});
+      if (!e.payload.ok) setError(e.payload.error || "下载失败");
+      refresh();
+    });
+    return () => {
+      void p.then((fn) => fn());
+      void d.then((fn) => fn());
+    };
+  }, []);
+
+  const missing = statuses.filter((m) => !m.ready).map((m) => m.id);
+  const totalMissingBytes = statuses
+    .filter((m) => !m.ready)
+    .reduce((acc, m) => acc + (m.totalBytes - m.presentBytes), 0);
+
+  return (
+    <Card
+      title="转写模型（本地离线）"
+      desc="Paraformer-large（字符级时间戳）+ silero-VAD + CT-Transformer 标点 · 全部在本机推理"
+    >
+      {error && <div className="text-xs text-red-300">{error}</div>}
+      <div className="space-y-2">
+        {statuses.map((m) => {
+          const p = progress[m.id];
+          return (
+            <div key={m.id} className="flex items-center gap-3 text-xs">
+              <span
+                className={`w-2 h-2 rounded-full shrink-0 ${
+                  m.ready ? "bg-jade-accent" : p ? "bg-cyan-accent animate-pulse" : "bg-ink-600"
+                }`}
+              />
+              <span className="flex-1 text-mist-300">{m.name}</span>
+              {p ? (
+                <span className="text-ink-500 tabular-nums">
+                  {formatBytes(p.bytes)} / {p.total ? formatBytes(p.total) : "?"} · {p.file}
+                </span>
+              ) : m.ready ? (
+                <span className="text-jade-accent">就绪</span>
+              ) : (
+                <span className="text-ink-500">约 {formatBytes(m.totalBytes)}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {statuses.length > 0 && missing.length > 0 && (
+        <button
+          className="px-3 py-1.5 rounded-lg text-sm bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium hover:opacity-90 disabled:opacity-50"
+          onClick={() => {
+            setError("");
+            setDownloading(true);
+            downloadModels(missing).catch((e) => {
+              setDownloading(false);
+              setError(errMsg(e));
+            });
+          }}
+          disabled={downloading}
+        >
+          {downloading
+            ? `下载中（约 ${formatBytes(totalMissingBytes)}）…`
+            : `下载缺失模型（约 ${formatBytes(totalMissingBytes)}）`}
+        </button>
+      )}
+      {downloading && (
+        <div className="w-full h-2 rounded-full bg-ink-800 overflow-hidden">
+          <div
+            className="h-full bg-gradient-to-r from-teal-accent to-cyan-accent transition-all"
+            style={{
+              width: `${Math.min(
+                100,
+                Math.round(
+                  (Object.values(progress).reduce((a, p) => a + p.bytes, 0) /
+                    Math.max(1, totalMissingBytes)) *
+                    100,
+                ),
+              )}%`,
+            }}
+          />
+        </div>
+      )}
+    </Card>
+  );
+}
+
 /** 设置页：存储 / 转写模型 / AI 复盘 / 关于 */
 export default function SettingsView() {
   const [info, setInfo] = useState<AppInfo | null>(null);
@@ -38,6 +147,8 @@ export default function SettingsView() {
   const [error, setError] = useState("");
   const [savedFlash, setSavedFlash] = useState(false);
   const [rootFlash, setRootFlash] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState("");
 
   useEffect(() => {
     Promise.all([getAppInfo(), getSettings()])
@@ -61,6 +172,24 @@ export default function SettingsView() {
       setTimeout(() => setSavedFlash(false), 1500);
     } catch (e) {
       setError(errMsg(e));
+    }
+  }
+
+  async function runTestLlm() {
+    setTesting(true);
+    setTestResult("");
+    try {
+      await setSettings({
+        "llm.baseUrl": llmBaseUrl.trim(),
+        "llm.apiKey": llmApiKey.trim(),
+        "llm.model": llmModel.trim(),
+      });
+      const reply = await testLlm();
+      setTestResult(`连接成功：${reply.slice(0, 50)}`);
+    } catch (e) {
+      setTestResult(`失败：${errMsg(e)}`);
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -102,14 +231,7 @@ export default function SettingsView() {
           </div>
         </Card>
 
-        <Card
-          title="转写模型（本地离线）"
-          desc="Paraformer-large（字符级时间戳）+ silero-VAD + CT-Transformer 标点"
-        >
-          <div className="text-xs text-mist-400">
-            模型下载与管理功能将在 M3 里程碑提供，届时首次转写前在此下载（约 260MB）。
-          </div>
-        </Card>
+        <ModelsCard />
 
         <Card
           title="AI 复盘（LLM）"
@@ -152,7 +274,23 @@ export default function SettingsView() {
             >
               保存
             </button>
+            <button
+              className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 disabled:opacity-50"
+              onClick={runTestLlm}
+              disabled={testing}
+            >
+              {testing ? "测试中…" : "测试连接"}
+            </button>
             {savedFlash && <span className="text-xs text-jade-accent">已保存 ✓</span>}
+            {testResult && (
+              <span
+                className={`text-xs truncate max-w-xs ${
+                  testResult.startsWith("失败") ? "text-red-300" : "text-jade-accent"
+                }`}
+              >
+                {testResult}
+              </span>
+            )}
           </div>
         </Card>
 

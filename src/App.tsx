@@ -1,5 +1,7 @@
 import { useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import logoUrl from "./assets/logo.svg";
+import { isTauri, type JobEvent } from "./api";
 import { useAppStore } from "./store";
 import LibraryView from "./views/LibraryView";
 import DetailView from "./views/DetailView";
@@ -55,12 +57,25 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  // 转写任务状态变化时刷新库列表（列表页也能看到状态流转）
+  useEffect(() => {
+    if (!isTauri()) return;
+    const un = listen<JobEvent>("job://progress", (e) => {
+      if (e.payload.status !== "running") {
+        void useAppStore.getState().refreshRecordings();
+      }
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
+
   return (
     <div className="h-full flex">
       <Sidebar />
       <main className="flex-1 min-w-0 overflow-hidden">
         {view.kind === "library" && <LibraryView />}
-        {view.kind === "detail" && <DetailView id={view.id} />}
+        {view.kind === "detail" && <DetailView key={view.id} id={view.id} seekMs={view.seekMs} />}
         {view.kind === "settings" && <SettingsView />}
       </main>
     </div>

@@ -67,6 +67,12 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         )?;
         conn.pragma_update(None, "user_version", 2)?;
     }
+    if version < 3 {
+        conn.execute_batch(
+            "ALTER TABLE segments ADD COLUMN chars TEXT NOT NULL DEFAULT '[]';",
+        )?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
     Ok(())
 }
 

@@ -18,6 +18,8 @@ interface PlayerBarProps {
   onSeek: (sec: number) => void;
   onSpeedChange: (speed: number) => void;
   onAddBookmark: () => void;
+  onLoadedMetadata?: () => void;
+  onLoadError?: (msg: string) => void;
 }
 
 /** 音频播放器：波形 + 控制（播放/快进快退/倍速/书签） */
@@ -34,6 +36,8 @@ export default function PlayerBar({
   onSeek,
   onSpeedChange,
   onAddBookmark,
+  onLoadedMetadata,
+  onLoadError,
 }: PlayerBarProps) {
   const src = convertFileSrc(filePath);
 
@@ -69,6 +73,12 @@ export default function PlayerBar({
         onPlay={() => onPlayingChange(true)}
         onPause={() => onPlayingChange(false)}
         onEnded={() => onPlayingChange(false)}
+        onLoadedMetadata={onLoadedMetadata}
+        onError={() =>
+          onLoadError?.(
+            "音频加载失败（文件可能已被移动或删除，或格式无法在应用内播放）",
+          )
+        }
       />
 
       <Waveform

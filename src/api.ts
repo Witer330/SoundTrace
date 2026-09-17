@@ -97,6 +97,100 @@ export async function deleteBookmark(id: number): Promise<void> {
   await invoke("delete_bookmark", { id });
 }
 
+// ---------- 转写（M3） ----------
+
+export interface ModelStatus {
+  id: string;
+  name: string;
+  ready: boolean;
+  presentBytes: number;
+  totalBytes: number;
+}
+
+export async function modelsStatus(): Promise<ModelStatus[]> {
+  return invoke("models_status");
+}
+
+export async function downloadModels(ids: string[]): Promise<void> {
+  await invoke("download_models", { ids });
+}
+
+export interface TranscriptSegment {
+  id: number;
+  recordingId: number;
+  startMs: number;
+  endMs: number;
+  text: string;
+  /** JSON: [[char, ms], ...] */
+  chars: string;
+}
+
+export async function listSegments(recordingId: number): Promise<TranscriptSegment[]> {
+  return invoke("list_segments", { recordingId });
+}
+
+export async function transcribeRecording(recordingId: number): Promise<number> {
+  return invoke("transcribe", { recordingId });
+}
+
+export async function cancelTranscribe(recordingId: number): Promise<void> {
+  await invoke("cancel_transcribe", { recordingId });
+}
+
+export interface JobEvent {
+  recordingId: number;
+  status: "queued" | "running" | "done" | "failed" | "canceled";
+  progress: number;
+  error: string;
+}
+
+export interface ModelDownloadProgress {
+  modelId: string;
+  bytes: number;
+  total: number;
+  file: string;
+}
+
+// ---------- 检索 / AI 复盘 / 导出（M4） ----------
+
+export interface SearchResults {
+  recordings: {
+    id: number;
+    title: string;
+    recordedAt: string | null;
+    durationSec: number;
+    status: string;
+    tags: string[];
+  }[];
+  segments: {
+    recordingId: number;
+    recordingTitle: string;
+    recordedAt: string | null;
+    startMs: number;
+    snippet: string;
+  }[];
+}
+
+export async function searchAll(query: string): Promise<SearchResults> {
+  return invoke("search_all", { query });
+}
+
+export async function generateSummary(recordingId: number): Promise<void> {
+  await invoke("generate_summary", { recordingId });
+}
+
+export async function testLlm(): Promise<string> {
+  return invoke("test_llm");
+}
+
+export async function exportRecording(
+  recordingId: number,
+  kind: "md" | "srt" | "txt",
+  dest: string,
+): Promise<void> {
+  await invoke("export_recording", { recordingId, kind, dest });
+}
+
 /** 后端错误统一为 { msg }，提取可读文本 */
 export function errMsg(e: unknown): string {
   if (typeof e === "string") return e;

@@ -46,7 +46,7 @@ pub struct Recording {
     pub tags: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedItem {
     pub path: String,
@@ -485,6 +485,7 @@ impl<'a> Importer<'a> {
     }
 
     /// 删除录音；delete_file 为 true 时同时删除归档文件
+    #[allow(dead_code)]
     pub fn delete_recording(&self, id: i64, delete_file: bool) -> AppResult<()> {
         let file_path: Option<String> = {
             let conn = self.db.conn.lock().unwrap();

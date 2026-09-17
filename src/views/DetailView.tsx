@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import PlayerBar from "../components/PlayerBar";
+import TranscriptPanel from "../components/TranscriptPanel";
+import SummaryPanel from "../components/SummaryPanel";
 import {
   addBookmark,
   deleteBookmark,
   deleteRecording,
   ensurePeaks,
   errMsg,
+  exportRecording,
   getRecording,
   listBookmarks,
   updateRecording,
@@ -22,7 +26,7 @@ import {
   type Recording,
 } from "../types";
 
-export default function DetailView({ id }: { id: number }) {
+export default function DetailView({ id, seekMs }: { id: number; seekMs?: number }) {
   const go = useAppStore((s) => s.go);
   const [rec, setRec] = useState<Recording | null>(null);
   const [error, setError] = useState("");
@@ -31,6 +35,7 @@ export default function DetailView({ id }: { id: number }) {
 
   // 播放器状态
   const audioRef = useRef<HTMLAudioElement>(null);
+  const pendingSeekRef = useRef<number | null>(null);
   const [peaks, setPeaks] = useState<number[]>([]);
   const [peaksLoading, setPeaksLoading] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
@@ -50,6 +55,33 @@ export default function DetailView({ id }: { id: number }) {
     audio.currentTime = sec;
     setCurrentTime(sec);
   }, []);
+
+  const refreshRec = useCallback(() => {
+    getRecording(id)
+      .then((r) => {
+        if (r) setRec(r);
+      })
+      .catch(() => undefined);
+  }, [id]);
+
+  // 从全局搜索跳入时定位到命中时间点（等元数据就绪后执行）
+  useEffect(() => {
+    if (seekMs === undefined) return;
+    const audio = audioRef.current;
+    if (audio && audio.readyState >= 1) {
+      seek(seekMs / 1000);
+    } else {
+      pendingSeekRef.current = seekMs;
+    }
+  }, [seekMs, seek]);
+
+  function onAudioMetadata() {
+    const pending = pendingSeekRef.current;
+    if (pending !== null) {
+      pendingSeekRef.current = null;
+      seek(pending / 1000);
+    }
+  }
 
   const addBookmarkHere = useCallback(async () => {
     if (!rec) return;
@@ -163,6 +195,30 @@ export default function DetailView({ id }: { id: number }) {
     }
   }
 
+  async function doExport(kind: "md" | "srt" | "txt") {
+    if (!rec) return;
+    const extLabel = kind === "md" ? "Markdown 纪要" : kind === "srt" ? "字幕" : "纯文本";
+    const safeTitle = rec.title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    const dest = await saveDialog({
+      title: `导出${extLabel}`,
+      defaultPath: `${safeTitle}.${kind}`,
+      filters: [
+        {
+          name: extLabel,
+          extensions: [kind],
+        },
+      ],
+    });
+    if (!dest) return;
+    try {
+      await exportRecording(rec.id, kind, dest);
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 1500);
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  }
+
   if (error && !rec) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3">
@@ -189,6 +245,31 @@ export default function DetailView({ id }: { id: number }) {
           ← 返回
         </button>
         <div className="flex-1 truncate text-mist-200">{rec.title}</div>
+        <details className="relative">
+          <summary className="list-none px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 cursor-pointer select-none">
+            导出 ▾
+          </summary>
+          <div className="absolute right-0 top-full mt-1 z-20 w-40 bg-ink-850 border border-ink-700 rounded-lg shadow-xl py-1 text-sm">
+            <button
+              className="w-full text-left px-3 py-1.5 text-mist-300 hover:bg-ink-700"
+              onClick={() => void doExport("md")}
+            >
+              Markdown 纪要
+            </button>
+            <button
+              className="w-full text-left px-3 py-1.5 text-mist-300 hover:bg-ink-700"
+              onClick={() => void doExport("srt")}
+            >
+              SRT 字幕
+            </button>
+            <button
+              className="w-full text-left px-3 py-1.5 text-mist-300 hover:bg-ink-700"
+              onClick={() => void doExport("txt")}
+            >
+              纯文本
+            </button>
+          </div>
+        </details>
         <button
           className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"
           onClick={() => void revealItemInDir(rec.filePath).catch((e) => setError(errMsg(e)))}
@@ -232,6 +313,8 @@ export default function DetailView({ id }: { id: number }) {
                 onSeek={seek}
                 onSpeedChange={setSpeed}
                 onAddBookmark={addBookmarkHere}
+                onLoadedMetadata={onAudioMetadata}
+                onLoadError={setError}
               />
             )}
 
@@ -263,12 +346,14 @@ export default function DetailView({ id }: { id: number }) {
             )}
           </div>
 
-          <div className="rounded-xl border border-ink-800 bg-ink-900 p-4 min-h-[240px]">
-            <div className="text-mist-300 text-sm font-medium mb-2">转写稿</div>
-            <div className="text-mist-400 text-xs">
-              转写功能将在 M3 里程碑提供（本地离线 · Paraformer）。
-            </div>
-          </div>
+          <TranscriptPanel
+            rec={rec}
+            currentTime={currentTime}
+            seek={seek}
+            onChanged={refreshRec}
+          />
+
+          <SummaryPanel rec={rec} onChanged={refreshRec} />
         </div>
 
         {/* 右列：元数据 */}
