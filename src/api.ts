@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
+  Bookmark,
   ImportResult,
   Recording,
   RecordingPatch,
@@ -69,6 +70,31 @@ export async function deleteRecording(
   deleteFile: boolean,
 ): Promise<void> {
   await invoke("delete_recording", { id, deleteFile });
+}
+
+// ---------- 播放器（M2） ----------
+
+export async function ensurePeaks(
+  id: number,
+): Promise<{ peaks: number[]; durationSec: number }> {
+  return invoke("ensure_peaks", { id });
+}
+
+export async function listBookmarks(recordingId: number): Promise<Bookmark[]> {
+  return invoke("list_bookmarks", { recordingId });
+}
+
+export async function addBookmark(
+  recordingId: number,
+  timeMs: number,
+  label: string,
+  note = "",
+): Promise<Bookmark> {
+  return invoke("add_bookmark", { recordingId, timeMs, label, note });
+}
+
+export async function deleteBookmark(id: number): Promise<void> {
+  await invoke("delete_bookmark", { id });
 }
 
 /** 后端错误统一为 { msg }，提取可读文本 */

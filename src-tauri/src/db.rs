@@ -61,6 +61,12 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         conn.execute_batch(SCHEMA_V1)?;
         conn.pragma_update(None, "user_version", 1)?;
     }
+    if version < 2 {
+        conn.execute_batch(
+            "ALTER TABLE recordings ADD COLUMN peaks BLOB;",
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
     Ok(())
 }
 
