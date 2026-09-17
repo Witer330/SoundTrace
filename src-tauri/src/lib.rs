@@ -257,13 +257,16 @@ struct Segment {
     end_ms: i64,
     text: String,
     chars: String,
+    speaker: Option<i64>,
+    /// 是否被手工改过（重新转写会覆盖分段，用它提示用户）
+    edited: bool,
 }
 
 #[tauri::command]
 fn list_segments(state: State<AppState>, recording_id: i64) -> AppResult<Vec<Segment>> {
     let conn = state.db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, recording_id, start_ms, end_ms, text, chars
+        "SELECT id, recording_id, start_ms, end_ms, text, chars, speaker, edited
          FROM segments WHERE recording_id = ?1 ORDER BY start_ms",
     )?;
     let rows = stmt
@@ -275,10 +278,247 @@ fn list_segments(state: State<AppState>, recording_id: i64) -> AppResult<Vec<Seg
                 end_ms: r.get(3)?,
                 text: r.get(4)?,
                 chars: r.get(5)?,
+                speaker: r.get(6)?,
+                edited: r.get::<_, i64>(7)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+// ---------- 转写稿编辑与说话人标注（M7） ----------
+
+/// 解析字符时间轴 JSON：[[char, ms], ...]
+fn parse_chars(json: &str) -> Vec<(String, i64)> {
+    serde_json::from_str::<Vec<(String, i64)>>(json).unwrap_or_default()
+}
+
+/// 合并多个分段的时间轴：按字符是否重复去重，再统一偏移到合并后文本的坐标。
+/// 分段重叠区（VAD 切分的尾巴）会重复同一句话，去重可避免合并后在交界处出现重复字符。
+fn merge_chars(parts: &[String]) -> String {
+    let mut all: Vec<(String, i64)> = Vec::new();
+    for p in parts {
+        all.extend(parse_chars(p));
+    }
+    let mut deduped: Vec<(String, i64)> = Vec::with_capacity(all.len());
+    for (ch, ms) in all {
+        if let Some((prev_ch, _)) = deduped.last() {
+            if *prev_ch == ch {
+                continue;
+            }
+        }
+        deduped.push((ch, ms));
+    }
+    serde_json::to_string(&deduped).unwrap_or_else(|_| "[]".into())
+}
+
+/// 改写某分段文本（手工修正错字）。文本已变，原字符级时间轴不再对应，清空之。
+#[tauri::command]
+fn update_segment(state: State<AppState>, id: i64, text: String) -> AppResult<()> {
+    let conn = state.db.conn.lock().unwrap();
+    let n = conn.execute(
+        "UPDATE segments SET text=?1, chars='[]', edited=1 WHERE id=?2",
+        rusqlite::params![text, id],
+    )?;
+    if n == 0 {
+        return Err(error::err("分段不存在（可能已被重新转写覆盖）"));
+    }
+    Ok(())
+}
+
+/// 删除某分段（识别成噪音或纯静音的空段）
+#[tauri::command]
+fn delete_segment(state: State<AppState>, id: i64) -> AppResult<()> {
+    let conn = state.db.conn.lock().unwrap();
+    conn.execute("DELETE FROM segments WHERE id=?1", [id])?;
+    Ok(())
+}
+
+/// 合并若干相邻分段为一段：起点取首个、终点取末个，文本拼接，时间轴去重合并。
+/// 要求同属一条录音且按时间相邻（允许中间有空隙，不允许跨越其它分段）。
+pub fn merge_segments_impl(db: &db::Db, ids: &[i64]) -> AppResult<i64> {
+    if ids.len() < 2 {
+        return Err(error::err("至少选择两段才能合并"));
+    }
+    let conn = db.conn.lock().unwrap();
+    let tx = conn.unchecked_transaction()?;
+
+    let mut rows: Vec<(i64, i64, i64, i64, String, String)> = Vec::new();
+    for id in ids {
+        let row = tx
+            .query_row(
+                "SELECT id, recording_id, start_ms, end_ms, text, chars FROM segments WHERE id=?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| error::err("分段不存在（可能已被重新转写覆盖）"))?;
+        rows.push(row);
+    }
+    rows.sort_by_key(|r| r.2);
+
+    let rec_id = rows[0].1;
+    if rows.iter().any(|r| r.1 != rec_id) {
+        return Err(error::err("不能跨录音合并分段"));
+    }
+    // 合并区间内不得夹着未选中的分段，否则会打乱稿子顺序
+    let start = rows[0].2;
+    let end = rows.iter().map(|r| r.3).max().unwrap_or(rows[0].3);
+    let between: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM segments
+         WHERE recording_id=?1 AND start_ms >= ?2 AND end_ms <= ?3 AND id NOT IN (SELECT value FROM json_each(?4))",
+        rusqlite::params![rec_id, start, end, serde_json::to_string(ids).unwrap()],
+        |r| r.get(0),
+    )?;
+    if between > 0 {
+        return Err(error::err("所选分段之间夹着其它分段，请选择连续的分段"));
+    }
+
+    let keep = rows[0].0;
+    let text = rows
+        .iter()
+        .map(|r| r.4.trim())
+        .collect::<Vec<_>>()
+        .join("");
+    let chars = merge_chars(&rows.iter().map(|r| r.5.clone()).collect::<Vec<_>>());
+    tx.execute(
+        "UPDATE segments SET text=?1, chars=?2, start_ms=?3, end_ms=?4, edited=1 WHERE id=?5",
+        rusqlite::params![text, chars, start, end, keep],
+    )?;
+    for r in rows.iter().skip(1) {
+        tx.execute("DELETE FROM segments WHERE id=?1", [r.0])?;
+    }
+    tx.commit()?;
+    Ok(keep)
+}
+
+#[tauri::command]
+fn merge_segments(state: State<AppState>, ids: Vec<i64>) -> AppResult<i64> {
+    merge_segments_impl(&state.db, &ids)
+}
+
+/// 标注某分段的说话人（1 起编号；传 null 清除）
+#[tauri::command]
+fn set_segment_speaker(state: State<AppState>, id: i64, speaker: Option<i64>) -> AppResult<()> {
+    let conn = state.db.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE segments SET speaker=?1, edited=1 WHERE id=?2",
+        rusqlite::params![speaker, id],
+    )?;
+    Ok(())
+}
+
+/// 说话人显示名（内存字典，按录音存 settings）；未命名的按「说话人 N」展示
+#[tauri::command]
+fn get_speaker_names(
+    state: State<AppState>,
+    recording_id: i64,
+) -> AppResult<HashMap<String, String>> {
+    let key = format!("speakers.{recording_id}");
+    match state.db.get_setting(&key)? {
+        Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+        None => Ok(HashMap::new()),
+    }
+}
+
+#[tauri::command]
+fn set_speaker_names(
+    state: State<AppState>,
+    recording_id: i64,
+    names: HashMap<String, String>,
+) -> AppResult<()> {
+    let mut m = HashMap::new();
+    m.insert(
+        format!("speakers.{recording_id}"),
+        serde_json::to_string(&names).unwrap_or_else(|_| "{}".into()),
+    );
+    state.db.set_settings(&m)
+}
+
+/// 从时间中点把一段拆成两段（前端「拆」按钮）。
+/// 有字符时间轴时按最接近中点的字符切分，两半各自保留自己的时间轴；
+/// 没有时间轴（已被改过字的段）时按字符数均分文本。
+/// 两半都会标记 edited —— 拆分本身也是手工修改。
+pub fn split_segment_impl(db: &db::Db, id: i64, at_ms: i64) -> AppResult<i64> {
+    let conn = db.conn.lock().unwrap();
+    let tx = conn.unchecked_transaction()?;
+    let (rec_id, start, end, text, chars): (i64, i64, i64, String, String) = tx
+        .query_row(
+            "SELECT recording_id, start_ms, end_ms, text, chars FROM segments WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(|_| error::err("分段不存在（可能已被重新转写覆盖）"))?;
+    if at_ms <= start || at_ms >= end {
+        return Err(error::err("拆分点必须落在分段内部"));
+    }
+
+    let all = parse_chars(&chars);
+    let (head_text, tail_text, head_chars, tail_chars) = if all.len() > 1 {
+        let cut = all
+            .iter()
+            .position(|(_, ms)| *ms >= at_ms)
+            .filter(|i| *i > 0 && *i < all.len())
+            .unwrap_or(all.len() / 2);
+        // 时间轴的字符数与文本一致时才用它做切分依据，否则退化为按文本长度均分
+        let joined: String = all.iter().map(|(c, _)| c.as_str()).collect();
+        if joined == text {
+            (
+                all[..cut].iter().map(|(c, _)| c.as_str()).collect::<String>(),
+                all[cut..].iter().map(|(c, _)| c.as_str()).collect::<String>(),
+                serde_json::to_string(&all[..cut]).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&all[cut..]).unwrap_or_else(|_| "[]".into()),
+            )
+        } else {
+            let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
+            (text[..mid].to_string(), text[mid..].to_string(), "[]".into(), "[]".into())
+        }
+    } else {
+        let mid = text.char_indices().nth(text.chars().count() / 2).map(|(i, _)| i).unwrap_or(0);
+        (text[..mid].to_string(), text[mid..].to_string(), "[]".into(), "[]".into())
+    };
+
+    tx.execute(
+        "UPDATE segments SET text=?1, chars=?2, end_ms=?3, edited=1 WHERE id=?4",
+        rusqlite::params![head_text, head_chars, at_ms, id],
+    )?;
+    let tail_id = tx.query_row(
+        "INSERT INTO segments(recording_id, start_ms, end_ms, text, chars, edited)
+         VALUES(?1, ?2, ?3, ?4, ?5, 1) RETURNING id",
+        rusqlite::params![rec_id, at_ms, end, tail_text, tail_chars],
+        |r| r.get(0),
+    )?;
+    tx.commit()?;
+    Ok(tail_id)
+}
+
+#[tauri::command]
+fn split_segment(state: State<AppState>, id: i64, at_ms: i64) -> AppResult<i64> {
+    split_segment_impl(&state.db, id, at_ms)
+}
+
+/// 该录音有多少段被手工改过（重新转写前提示用）
+pub fn count_edited_segments_impl(db: &db::Db, recording_id: i64) -> AppResult<i64> {
+    let conn = db.conn.lock().unwrap();
+    let n = conn.query_row(
+        "SELECT COUNT(*) FROM segments WHERE recording_id=?1 AND edited=1",
+        [recording_id],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+#[tauri::command]
+fn count_edited_segments(state: State<AppState>, recording_id: i64) -> AppResult<i64> {
+    count_edited_segments_impl(&state.db, recording_id)
 }
 
 /// 入队一条转写任务（若该录音无未完成任务）
@@ -541,6 +781,14 @@ pub fn run() {
             cancel_transcribe,
             get_job,
             list_jobs,
+            update_segment,
+            delete_segment,
+            merge_segments,
+            split_segment,
+            set_segment_speaker,
+            get_speaker_names,
+            set_speaker_names,
+            count_edited_segments,
             search_all,
             generate_summary,
             test_llm,

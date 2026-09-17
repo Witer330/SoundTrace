@@ -1,9 +1,20 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEffect } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import Waveform from "./Waveform";
+import { isTauri } from "../api";
 import { formatMsTime } from "../types";
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+
+/**
+ * 把库内文件路径转成可播放的 asset URL。
+ * 纯浏览器（无 Tauri 壳）里 convertFileSrc 会去读不存在的 __TAURI_INTERNALS__ 而抛错，
+ * 因此这里必须先判断运行环境，返回空 src 由调用方按「加载失败」处理。
+ */
+function toAssetUrl(filePath: string): string {
+  if (!isTauri()) return "";
+  return convertFileSrc(filePath);
+}
 
 interface PlayerBarProps {
   filePath: string;
@@ -39,7 +50,7 @@ export default function PlayerBar({
   onLoadedMetadata,
   onLoadError,
 }: PlayerBarProps) {
-  const src = convertFileSrc(filePath);
+  const src = toAssetUrl(filePath);
 
   useEffect(() => {
     const audio = audioRef.current;

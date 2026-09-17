@@ -123,10 +123,52 @@ export interface TranscriptSegment {
   text: string;
   /** JSON: [[char, ms], ...] */
   chars: string;
+  /** 说话人编号（1 起），未标注为 null */
+  speaker: number | null;
+  /** 是否被手工改过 */
+  edited: boolean;
 }
 
 export async function listSegments(recordingId: number): Promise<TranscriptSegment[]> {
   return invoke("list_segments", { recordingId });
+}
+
+export async function updateSegment(id: number, text: string): Promise<void> {
+  await invoke("update_segment", { id, text });
+}
+
+export async function deleteSegment(id: number): Promise<void> {
+  await invoke("delete_segment", { id });
+}
+
+/** 合并若干相邻分段，返回保留（首个）分段的 id */
+export async function mergeSegments(ids: number[]): Promise<number> {
+  return invoke("merge_segments", { ids });
+}
+
+export async function setSegmentSpeaker(id: number, speaker: number | null): Promise<void> {
+  await invoke("set_segment_speaker", { id, speaker });
+}
+
+/** 从时间中点把一段拆成两段，返回新段 id */
+export async function splitSegment(id: number, atMs: number): Promise<number> {
+  return invoke("split_segment", { id, atMs });
+}
+
+export async function getSpeakerNames(recordingId: number): Promise<Record<string, string>> {
+  return invoke("get_speaker_names", { recordingId });
+}
+
+export async function setSpeakerNames(
+  recordingId: number,
+  names: Record<string, string>,
+): Promise<void> {
+  await invoke("set_speaker_names", { recordingId, names });
+}
+
+/** 该录音被手工改过的分段数（重新转写前提示用） */
+export async function countEditedSegments(recordingId: number): Promise<number> {
+  return invoke("count_edited_segments", { recordingId });
 }
 
 export async function transcribeRecording(recordingId: number): Promise<number> {

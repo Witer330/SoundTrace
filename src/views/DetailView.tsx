@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import PlayerBar from "../components/PlayerBar";
 import TranscriptPanel from "../components/TranscriptPanel";
 import SummaryPanel from "../components/SummaryPanel";
+import PipelinePanel from "../components/PipelinePanel";
 import {
   addBookmark,
   deleteBookmark,
@@ -12,7 +13,9 @@ import {
   errMsg,
   exportRecording,
   getRecording,
+  isTauri,
   listBookmarks,
+  listSegments,
   updateRecording,
 } from "../api";
 import { useAppStore } from "../store";
@@ -26,12 +29,17 @@ import {
   type Recording,
 } from "../types";
 
+type Tab = "transcript" | "summary" | "info";
+
 export default function DetailView({ id, seekMs }: { id: number; seekMs?: number }) {
   const go = useAppStore((s) => s.go);
+  const jobs = useAppStore((s) => s.jobs);
   const [rec, setRec] = useState<Recording | null>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
+  const [tab, setTab] = useState<Tab>("transcript");
+  const [segCount, setSegCount] = useState(0);
 
   // 播放器状态
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -49,6 +57,11 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   const [tagsText, setTagsText] = useState("");
   const [notes, setNotes] = useState("");
 
+  const job = useMemo(
+    () => jobs.find((j) => j.recordingId === id && (j.status === "running" || j.status === "pending")),
+    [jobs, id],
+  );
+
   const seek = useCallback((sec: number) => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -64,7 +77,18 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
       .catch(() => undefined);
   }, [id]);
 
-  // 从全局搜索跳入时定位到命中时间点（等元数据就绪后执行）
+  /**
+   * 详情页的数据入口。后端读不到时回退到 store 里已加载的行（列表数据通常够渲染），
+   * 这样「后端短暂不可达」或纯浏览器预览时页面不会整屏报错。
+   */
+  const fallbackRec = useCallback(
+    () => useAppStore.getState().recordings.find((r) => r.id === id),
+    [id],
+  );
+
+  // 从全局搜索跳入时定位到命中时间点（等元数据就绪后执行）。
+  // 依赖 peaksLoading：波形加载期间 PlayerBar 不渲染、audio 元素尚不存在，
+  // 若只依赖 seekMs，这次定位会被静默丢掉（表现为「搜到的片段点进来没跳过去」）。
   useEffect(() => {
     if (seekMs === undefined) return;
     const audio = audioRef.current;
@@ -73,7 +97,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
     } else {
       pendingSeekRef.current = seekMs;
     }
-  }, [seekMs, seek]);
+  }, [seekMs, seek, peaksLoading]);
 
   function onAudioMetadata() {
     const pending = pendingSeekRef.current;
@@ -85,35 +109,42 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
 
   const addBookmarkHere = useCallback(async () => {
     if (!rec) return;
-    const label = window.prompt(
-      "书签名称：",
-      `书签 ${formatMsTime(currentTime * 1000)}`,
-    );
+    const label = window.prompt("书签名称：", `书签 ${formatMsTime(currentTime * 1000)}`);
     if (label === null) return;
     try {
       const bm = await addBookmark(rec.id, Math.round(currentTime * 1000), label.trim());
-      setBookmarks((prev) =>
-        [...prev, bm].sort((a, b) => a.timeMs - b.timeMs),
-      );
+      setBookmarks((prev) => [...prev, bm].sort((a, b) => a.timeMs - b.timeMs));
     } catch (e) {
       setError(errMsg(e));
     }
   }, [rec, currentTime]);
 
   useEffect(() => {
+    const fallback = fallbackRec();
     getRecording(id)
       .then((r) => {
-        if (r) {
-          setRec(r);
-          setTitle(r.title);
-          setParticipants(r.participants);
-          setTagsText(r.tags.join(" "));
-          setNotes(r.notes);
+        const use = r ?? fallback;
+        if (use) {
+          setRec(use);
+          setTitle(use.title);
+          setParticipants(use.participants);
+          setTagsText(use.tags.join(" "));
+          setNotes(use.notes);
         } else {
           setError("录音不存在（可能已被删除）");
         }
       })
-      .catch((e) => setError(errMsg(e)));
+      .catch(() => {
+        if (fallback) {
+          setRec(fallback);
+          setTitle(fallback.title);
+          setParticipants(fallback.participants);
+          setTagsText(fallback.tags.join(" "));
+          setNotes(fallback.notes);
+        } else {
+          setError("无法读取录音信息");
+        }
+      });
 
     setPeaksLoading(true);
     ensurePeaks(id)
@@ -128,8 +159,12 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
 
     listBookmarks(id)
       .then(setBookmarks)
-      .catch((e) => setError(errMsg(e)));
-  }, [id]);
+      .catch(() => undefined);
+
+    listSegments(id)
+      .then((segs) => setSegCount(segs.length))
+      .catch(() => undefined);
+  }, [id, fallbackRec]);
 
   // 键盘快捷键：空格播放/暂停，B 加书签（输入框聚焦时忽略）
   useEffect(() => {
@@ -174,7 +209,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   async function doDelete() {
     if (!rec) return;
     const choice = window.confirm(
-      `确定删除「${rec.title}」吗？\n\n“删除”仅移除库记录（保留归档文件）；“彻底删除”同时删除音频文件，不可恢复。`,
+      `确定删除「${rec.title}」吗？\n\n"删除"仅移除库记录（保留归档文件）；"彻底删除"同时删除音频文件，不可恢复。`,
     );
     if (!choice) return;
     const wipe = window.confirm("是否同时删除归档的音频文件？（取消 = 仅移除库记录）");
@@ -202,12 +237,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
     const dest = await saveDialog({
       title: `导出${extLabel}`,
       defaultPath: `${safeTitle}.${kind}`,
-      filters: [
-        {
-          name: extLabel,
-          extensions: [kind],
-        },
-      ],
+      filters: [{ name: extLabel, extensions: [kind] }],
     });
     if (!dest) return;
     try {
@@ -223,29 +253,46 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3">
         <div className="text-st-err text-sm">{error}</div>
-        <button className="text-mist-400 hover:text-mist-200 text-sm" onClick={() => go({ kind: "library" })}>
-          返回录音库
+        <button
+          className="text-mist-400 hover:text-mist-200 text-sm"
+          onClick={() => go({ kind: "workbench" })}
+        >
+          返回工作台
         </button>
       </div>
     );
   }
 
   if (!rec) {
-    return <div className="h-full flex items-center justify-center text-mist-400 text-sm">加载中…</div>;
+    return (
+      <div className="h-full flex items-center justify-center text-mist-400 text-sm">加载中…</div>
+    );
   }
+
+  const tabs: { key: Tab; label: string; hint?: string }[] = [
+    { key: "transcript", label: "转写稿", hint: segCount > 0 ? String(segCount) : undefined },
+    { key: "summary", label: "AI 纪要", hint: rec.summaryMd ? "✓" : undefined },
+    { key: "info", label: "信息与元数据" },
+  ];
 
   return (
     <div className="h-full flex flex-col">
-      {/* 头部 */}
-      <div className="flex items-center gap-3 px-4 h-14 border-b border-ink-800 bg-ink-900/60">
+      {/* 头部条 */}
+      <div className="flex items-center gap-3 px-4 h-14 border-b border-ink-800 bg-ink-900/60 shrink-0">
         <button
-          className="text-mist-400 hover:text-mist-200 text-sm"
-          onClick={() => go({ kind: "library" })}
+          className="text-mist-400 hover:text-mist-200 text-sm shrink-0"
+          onClick={() => go({ kind: "workbench" })}
         >
           ← 返回
         </button>
-        <div className="flex-1 truncate text-mist-200">{rec.title}</div>
-        <details className="relative">
+        <div className="min-w-0 flex items-baseline gap-2 flex-1">
+          <span className="text-mist-100 truncate font-medium">{rec.title}</span>
+          <span className="text-[11px] text-ink-500 shrink-0 tabular-nums">
+            {STATUS_LABEL[rec.status]} · {formatDuration(rec.durationSec)} ·{" "}
+            {formatDateTime(rec.recordedAt)}
+          </span>
+        </div>
+        <details className="relative shrink-0">
           <summary className="list-none px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 cursor-pointer select-none">
             导出 ▾
           </summary>
@@ -271,168 +318,208 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
           </div>
         </details>
         <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"
+          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 shrink-0"
           onClick={() => void revealItemInDir(rec.filePath).catch((e) => setError(errMsg(e)))}
         >
-          打开所在位置
+          打开位置
         </button>
         <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"
-          onClick={save}
-          disabled={saving}
-        >
-          {savedFlash ? "已保存 ✓" : saving ? "保存中…" : "保存"}
-        </button>
-        <button
-          className="px-3 py-1.5 rounded-lg text-sm bg-st-err-soft hover:bg-st-err/20 text-st-err"
+          className="px-3 py-1.5 rounded-lg text-sm bg-st-err-soft hover:bg-st-err/20 text-st-err shrink-0"
           onClick={doDelete}
         >
           删除
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 grid grid-cols-[1fr_320px] gap-4">
-        {/* 左列：播放器 + 转写（M3） */}
-        <div className="space-y-4">
-          <div className="rounded-xl border border-ink-800 bg-ink-900 p-4">
-            {peaksLoading ? (
-              <div className="h-24 flex items-center justify-center text-mist-400 text-sm">
-                正在生成波形（首次打开需解码音频）…
-              </div>
-            ) : (
-              <PlayerBar
-                filePath={rec.filePath}
-                peaks={peaks}
-                durationSec={rec.durationSec}
-                currentTime={currentTime}
-                playing={playing}
-                speed={speed}
-                audioRef={audioRef}
-                onTimeUpdate={setCurrentTime}
-                onPlayingChange={setPlaying}
-                onSeek={seek}
-                onSpeedChange={setSpeed}
-                onAddBookmark={addBookmarkHere}
-                onLoadedMetadata={onAudioMetadata}
-                onLoadError={setError}
-              />
-            )}
+      <div className="flex-1 min-h-0 flex">
+        {/* 左栏：处理流水线 */}
+        <PipelinePanel
+          rec={rec}
+          job={job}
+          currentTime={currentTime}
+          segmentCount={segCount}
+          peaksReady={!peaksLoading && peaks.length > 0}
+          onSeek={seek}
+          onChanged={refreshRec}
+        />
 
-            {/* 书签条 */}
-            {bookmarks.length > 0 && (
-              <div className="flex gap-1.5 flex-wrap mt-3 pt-3 border-t border-ink-800">
-                {bookmarks.map((bm) => (
-                  <span
-                    key={bm.id}
-                    className="group inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-ink-800 hover:bg-ink-700 text-xs text-mist-300 cursor-pointer"
-                    onClick={() => seek(bm.timeMs / 1000)}
-                    title={bm.note || bm.label}
-                  >
-                    <span className="text-cyan-accent">⚑</span>
-                    <span className="tabular-nums text-ink-500">{formatMsTime(bm.timeMs)}</span>
-                    {bm.label}
-                    <button
-                      className="text-ink-500 hover:text-st-err opacity-0 group-hover:opacity-100"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void removeBookmark(bm.id);
-                      }}
+        {/* 右栏：工作区 */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          {/* 播放器 */}
+          <div className="px-4 pt-3 shrink-0">
+            <div className="rounded-xl border border-ink-800 bg-ink-900 p-4">
+              {peaksLoading ? (
+                <div className="h-24 flex items-center justify-center text-mist-400 text-sm">
+                  正在生成波形（首次打开需解码音频）…
+                </div>
+              ) : (
+                <PlayerBar
+                  filePath={rec.filePath}
+                  peaks={peaks}
+                  durationSec={rec.durationSec}
+                  currentTime={currentTime}
+                  playing={playing}
+                  speed={speed}
+                  audioRef={audioRef}
+                  onTimeUpdate={setCurrentTime}
+                  onPlayingChange={setPlaying}
+                  onSeek={seek}
+                  onSpeedChange={setSpeed}
+                  onAddBookmark={addBookmarkHere}
+                  onLoadedMetadata={onAudioMetadata}
+                  onLoadError={(m) => {
+                    // 纯浏览器预览没有 asset 协议，这种「加载失败」不是真问题
+                    if (isTauri()) setError(m);
+                  }}
+                />
+              )}
+
+              {bookmarks.length > 0 && (
+                <div className="flex gap-1.5 flex-wrap mt-3 pt-3 border-t border-ink-800">
+                  {bookmarks.map((bm) => (
+                    <span
+                      key={bm.id}
+                      className="group inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-ink-800 hover:bg-ink-700 text-xs text-mist-300 cursor-pointer"
+                      onClick={() => seek(bm.timeMs / 1000)}
+                      title={bm.note || bm.label}
                     >
-                      ✕
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <TranscriptPanel
-            rec={rec}
-            currentTime={currentTime}
-            seek={seek}
-            onChanged={refreshRec}
-          />
-
-          <SummaryPanel rec={rec} onChanged={refreshRec} />
-        </div>
-
-        {/* 右列：元数据 */}
-        <div className="space-y-4">
-          <div className="rounded-xl border border-ink-800 bg-ink-900 p-4 space-y-3">
-            <div className="text-mist-300 text-sm font-medium">信息</div>
-            <dl className="text-xs space-y-1.5">
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">状态</dt>
-                <dd className="text-mist-300">{STATUS_LABEL[rec.status]}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">时长</dt>
-                <dd className="text-mist-300">{formatDuration(rec.durationSec)}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">大小</dt>
-                <dd className="text-mist-300">{formatBytes(rec.sizeBytes)}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">格式</dt>
-                <dd className="text-mist-300 uppercase">{rec.format}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">导入于</dt>
-                <dd className="text-mist-300">{formatDateTime(rec.createdAt)}</dd>
-              </div>
-              <div className="flex justify-between gap-2">
-                <dt className="text-ink-500">原始文件</dt>
-                <dd className="text-mist-300 truncate max-w-[160px]" title={rec.origName}>
-                  {rec.origName}
-                </dd>
-              </div>
-            </dl>
-            <div className="text-[11px] text-ink-500 pt-1 border-t border-ink-800">
-              快捷键：空格 播放/暂停 · B 添加书签
+                      <span className="text-cyan-accent">⚑</span>
+                      <span className="tabular-nums text-ink-500">{formatMsTime(bm.timeMs)}</span>
+                      {bm.label}
+                      <button
+                        className="text-ink-500 hover:text-st-err opacity-0 group-hover:opacity-100"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void removeBookmark(bm.id);
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
-          <div className="rounded-xl border border-ink-800 bg-ink-900 p-4 space-y-3">
-            <div className="text-mist-300 text-sm font-medium">元数据</div>
-            <label className="block space-y-1">
-              <span className="text-xs text-ink-500">标题</span>
-              <input
-                type="text"
-                className="w-full"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-xs text-ink-500">参会人（逗号或空格分隔）</span>
-              <input
-                type="text"
-                className="w-full"
-                value={participants}
-                onChange={(e) => setParticipants(e.target.value)}
-                placeholder="张三 李四 王五"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-xs text-ink-500">标签（空格分隔）</span>
-              <input
-                type="text"
-                className="w-full"
-                value={tagsText}
-                onChange={(e) => setTagsText(e.target.value)}
-                placeholder="周会 项目A"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-xs text-ink-500">笔记</span>
-              <textarea
-                className="w-full min-h-[90px] resize-y"
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder="会议背景、待办提醒…"
-              />
-            </label>
+          {/* 标签页 */}
+          <div className="flex items-center gap-1 px-4 pt-3 shrink-0">
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setTab(t.key)}
+                className={`px-3 py-1.5 rounded-lg text-sm transition-colors flex items-center gap-1.5 ${
+                  tab === t.key
+                    ? "bg-ink-800 text-mist-100 font-medium"
+                    : "text-mist-400 hover:bg-ink-850 hover:text-mist-300"
+                }`}
+              >
+                {t.label}
+                {t.hint && (
+                  <span
+                    className={`text-[10px] tabular-nums ${
+                      t.hint === "✓" ? "text-st-ok" : "text-ink-500"
+                    }`}
+                  >
+                    {t.hint}
+                  </span>
+                )}
+              </button>
+            ))}
+            <div className="flex-1" />
+            <span className="text-[11px] text-ink-500">空格 播放/暂停 · B 加书签</span>
+          </div>
+
+          {/* 内容区 */}
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 pt-3">
+            {tab === "transcript" && (
+              <div className="h-full min-h-[400px] flex flex-col">
+                <TranscriptPanel
+                  rec={rec}
+                  currentTime={currentTime}
+                  seek={seek}
+                  onChanged={() => {
+                    refreshRec();
+                    listSegments(id)
+                      .then((segs) => setSegCount(segs.length))
+                      .catch(() => undefined);
+                  }}
+                />
+              </div>
+            )}
+
+            {tab === "summary" && <SummaryPanel rec={rec} onChanged={refreshRec} />}
+
+            {tab === "info" && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 max-w-4xl">
+                <div className="rounded-xl border border-ink-800 bg-ink-900 p-4 space-y-3">
+                  <div className="text-mist-300 text-sm font-medium">信息</div>
+                  <dl className="text-xs space-y-1.5">
+                    <Row label="状态" value={STATUS_LABEL[rec.status]} />
+                    <Row label="时长" value={formatDuration(rec.durationSec)} />
+                    <Row label="大小" value={formatBytes(rec.sizeBytes)} />
+                    <Row label="格式" value={rec.format.toUpperCase()} />
+                    <Row label="录制时间" value={formatDateTime(rec.recordedAt)} />
+                    <Row label="导入于" value={formatDateTime(rec.createdAt)} />
+                    <Row label="原始文件" value={rec.origName} />
+                    <Row label="转写分段" value={segCount ? `${segCount} 段` : "—"} />
+                    <Row label="AI 纪要" value={rec.summaryMd ? `由 ${rec.llmModel ?? "LLM"} 生成` : "—"} />
+                  </dl>
+                </div>
+
+                <div className="rounded-xl border border-ink-800 bg-ink-900 p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <div className="text-mist-300 text-sm font-medium">元数据</div>
+                    <div className="flex-1" />
+                    <button
+                      className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200 disabled:opacity-50"
+                      onClick={save}
+                      disabled={saving}
+                    >
+                      {savedFlash ? "已保存 ✓" : saving ? "保存中…" : "保存"}
+                    </button>
+                  </div>
+                  <label className="block space-y-1">
+                    <span className="text-xs text-ink-500">标题</span>
+                    <input
+                      type="text"
+                      className="w-full"
+                      value={title}
+                      onChange={(e) => setTitle(e.target.value)}
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="text-xs text-ink-500">参会人（逗号或空格分隔）</span>
+                    <input
+                      type="text"
+                      className="w-full"
+                      value={participants}
+                      onChange={(e) => setParticipants(e.target.value)}
+                      placeholder="张三 李四 王五"
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="text-xs text-ink-500">标签（空格分隔）</span>
+                    <input
+                      type="text"
+                      className="w-full"
+                      value={tagsText}
+                      onChange={(e) => setTagsText(e.target.value)}
+                      placeholder="周会 项目A"
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="text-xs text-ink-500">笔记</span>
+                    <textarea
+                      className="w-full min-h-[90px] resize-y"
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      placeholder="会议背景、待办提醒…"
+                    />
+                  </label>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -445,6 +532,17 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-2">
+      <dt className="text-ink-500 shrink-0">{label}</dt>
+      <dd className="text-mist-300 truncate" title={value}>
+        {value}
+      </dd>
     </div>
   );
 }

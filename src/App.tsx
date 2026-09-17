@@ -8,6 +8,7 @@ import LibraryView from "./views/LibraryView";
 import SearchView from "./views/SearchView";
 import DetailView from "./views/DetailView";
 import SettingsView from "./views/SettingsView";
+import ErrorBoundary from "./components/ErrorBoundary";
 import type { View } from "./types";
 
 function Icon({ kind }: { kind: string }) {
@@ -155,11 +156,13 @@ export default function App() {
     <div className="h-full flex">
       <Sidebar />
       <main className="flex-1 min-w-0 overflow-hidden">
-        {view.kind === "workbench" && <WorkbenchView />}
-        {view.kind === "library" && <LibraryView />}
-        {view.kind === "search" && <SearchView />}
-        {view.kind === "detail" && <DetailView key={view.id} id={view.id} seekMs={view.seekMs} />}
-        {view.kind === "settings" && <SettingsView />}
+        <ErrorBoundary key={view.kind === "detail" ? `d${view.id}` : view.kind}>
+          {view.kind === "workbench" && <WorkbenchView />}
+          {view.kind === "library" && <LibraryView />}
+          {view.kind === "search" && <SearchView />}
+          {view.kind === "detail" && <DetailView key={view.id} id={view.id} seekMs={view.seekMs} />}
+          {view.kind === "settings" && <SettingsView />}
+        </ErrorBoundary>
       </main>
     </div>
   );

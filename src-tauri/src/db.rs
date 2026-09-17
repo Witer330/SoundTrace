@@ -73,6 +73,13 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         )?;
         conn.pragma_update(None, "user_version", 3)?;
     }
+    if version < 4 {
+        // 手工编辑标记：重新转写会清空该录音的旧分段，有了标记才能在覆盖前提示用户
+        conn.execute_batch(
+            "ALTER TABLE segments ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        conn.pragma_update(None, "user_version", 4)?;
+    }
     Ok(())
 }
 
