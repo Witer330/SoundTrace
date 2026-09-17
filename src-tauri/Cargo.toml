@@ -1,6 +1,6 @@
 [package]
 name = "soundtrace"
-version = "0.1.0"
+version = "0.2.0"
 description = "声迹 SoundTrace — 本地会议录音库：导入、离线转写、检索、AI 复盘"
 authors = ["Witer330"]
 edition = "2021"
