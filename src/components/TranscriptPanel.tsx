@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   cancelTranscribe,
@@ -39,6 +39,80 @@ function splitHighlight(text: string, query: string): { t: string; hit: boolean 
   }
   return out;
 }
+
+interface RowProps {
+  seg: TranscriptSegment;
+  index: number;
+  isActive: boolean;
+  query: string;
+  onSeek: (sec: number) => void;
+}
+
+/**
+ * 单个分段行。用 memo 隔离：播放时 currentTime 每秒变化多次，
+ * 但只要「当前分段」没变，长列表（180 分钟会议可达数千段）就完全不重渲染。
+ */
+const SegmentRow = memo(function SegmentRow({
+  seg,
+  index,
+  isActive,
+  query,
+  onSeek,
+}: RowProps) {
+  // 字符级时间轴仅在当前分段解析（其余分段用整段跳转，省内存与 CPU）
+  const chars = useMemo(
+    () => (isActive ? parseChars(seg.chars) : []),
+    [isActive, seg.chars],
+  );
+  const q = query.trim().toLowerCase();
+
+  return (
+    <div
+      data-seg={index}
+      className={`group flex gap-3 px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${
+        isActive ? "bg-ink-800" : "hover:bg-ink-850"
+      }`}
+      onClick={() => onSeek(seg.startMs / 1000)}
+      title={`跳到 ${formatMsTime(seg.startMs)}`}
+    >
+      <span
+        className={`shrink-0 text-[11px] tabular-nums pt-0.5 select-none ${
+          isActive ? "text-cyan-accent" : "text-ink-500"
+        }`}
+      >
+        {formatMsTime(seg.startMs)}
+      </span>
+      <div className="text-sm leading-6 text-mist-200 flex-1">
+        {chars.length > 0
+          ? chars.map(([ch, ms], ci) => (
+              <span
+                key={ci}
+                className={`hover:bg-cyan-accent/20 hover:text-cyan-accent rounded px-px ${
+                  q && ch.toLowerCase().includes(q)
+                    ? "bg-cyan-accent/30 text-mist-200"
+                    : ""
+                }`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSeek(ms / 1000);
+                }}
+              >
+                {ch}
+              </span>
+            ))
+          : splitHighlight(seg.text, query.trim()).map(({ t, hit }, wi) =>
+              hit ? (
+                <mark key={wi} className="bg-cyan-accent/30 text-mist-200 rounded px-px">
+                  {t}
+                </mark>
+              ) : (
+                <span key={wi}>{t}</span>
+              ),
+            )}
+      </div>
+    </div>
+  );
+});
 
 interface Props {
   rec: Recording;
@@ -249,59 +323,16 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
           ) : segments.length === 0 ? (
             <div className="text-mist-400 text-sm py-4">（无转写内容）</div>
           ) : (
-            segments.map((seg, i) => {
-              const active = i === activeIdx;
-              const chars = active ? parseChars(seg.chars) : [];
-              return (
-                <div
-                  key={seg.id}
-                  data-seg={i}
-                  className={`group flex gap-3 px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${
-                    active ? "bg-ink-800" : "hover:bg-ink-850"
-                  }`}
-                  onClick={() => seek(seg.startMs / 1000)}
-                  title={`跳到 ${formatMsTime(seg.startMs)}`}
-                >
-                  <span
-                    className={`shrink-0 text-[11px] tabular-nums pt-0.5 select-none ${
-                      active ? "text-cyan-accent" : "text-ink-500"
-                    }`}
-                  >
-                    {formatMsTime(seg.startMs)}
-                  </span>
-                  <div className="text-sm leading-6 text-mist-200 flex-1">
-                    {active && chars.length > 0
-                      ? chars.map(([ch, ms], ci) => {
-                          const hit =
-                            search.trim() && ch.toLowerCase().includes(search.trim().toLowerCase());
-                          return (
-                            <span
-                              key={ci}
-                              className={`hover:bg-cyan-accent/20 hover:text-cyan-accent rounded px-px ${
-                                hit ? "bg-cyan-accent/30 text-mist-200" : ""
-                              }`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                seek(ms / 1000);
-                              }}
-                            >
-                              {ch}
-                            </span>
-                          );
-                        })
-                      : splitHighlight(seg.text, search.trim()).map(({ t, hit }, wi) =>
-                          hit ? (
-                            <mark key={wi} className="bg-cyan-accent/30 text-mist-200 rounded px-px">
-                              {t}
-                            </mark>
-                          ) : (
-                            <span key={wi}>{t}</span>
-                          ),
-                        )}
-                  </div>
-                </div>
-              );
-            })
+            segments.map((seg, i) => (
+              <SegmentRow
+                key={seg.id}
+                seg={seg}
+                index={i}
+                isActive={i === activeIdx}
+                query={search}
+                onSeek={seek}
+              />
+            ))
           )}
         </div>
       )}
