@@ -4,6 +4,10 @@ version = "0.2.0"
 description = "声迹 SoundTrace — 本地会议录音库：导入、离线转写、检索、AI 复盘"
 authors = ["Witer330"]
 edition = "2021"
+# 本 crate 有两个可执行文件：主程序 soundtrace 与转写子进程 st-transcribe。
+# 后者由主程序 spawn，不应作为 `cargo run` 的默认目标——不指定 default-run 的话
+# cargo 会直接报错「could not determine which binary to run」。
+default-run = "soundtrace"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
