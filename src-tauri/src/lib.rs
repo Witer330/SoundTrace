@@ -2,6 +2,7 @@ pub mod audio;
 pub mod db;
 pub mod error;
 pub mod export;
+pub mod job_runner;
 pub mod library;
 pub mod llm;
 pub mod models;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub db: Arc<db::Db>,
     pub data_root: PathBuf,
     pub cancel_flag: Arc<AtomicBool>,
+    /// 正在跑转写的子进程（录音 id, pid）；取消时要杀掉它才能立即停止
+    pub running_child: Arc<std::sync::Mutex<Option<(i64, u32)>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -566,6 +569,23 @@ fn transcribe(app: tauri::AppHandle, state: State<AppState>, recording_id: i64) 
 #[tauri::command]
 fn cancel_transcribe(app: tauri::AppHandle, state: State<AppState>, recording_id: i64) -> AppResult<()> {
     state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 正在跑的是这条录音时，直接杀掉它的子进程——否则要等当前这一大段解码完才停
+    if let Some((running_rec, pid)) = *state.running_child.lock().unwrap() {
+        if running_rec == recording_id {
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let conn = state.db.conn.lock().unwrap();
     let affected = conn.execute(
@@ -736,6 +756,9 @@ pub fn run() {
     paths::ensure_dirs(&data_root).expect("初始化数据目录失败");
     let database = std::sync::Arc::new(db::Db::open(&data_root).expect("打开数据库失败"));
     let cancel_flag = Arc::new(AtomicBool::new(false));
+    // 转写在子进程里跑（原生识别引擎的崩溃不会带走应用），这里记录当前子进程以便取消
+    let running_child: Arc<std::sync::Mutex<Option<(i64, u32)>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // 应用上次异常退出遗留的任务：running → pending，录音状态归位
     {
@@ -758,6 +781,7 @@ pub fn run() {
             db: database.clone(),
             data_root: data_root.clone(),
             cancel_flag: cancel_flag.clone(),
+            running_child: running_child.clone(),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_info,
@@ -807,6 +831,7 @@ pub fn run() {
                 data_root: state.data_root.clone(),
                 app: app.handle().clone(),
                 cancel: state.cancel_flag.clone(),
+                running: state.running_child.clone(),
             });
             Ok(())
         })

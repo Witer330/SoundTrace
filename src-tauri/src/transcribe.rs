@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::error::{err, AppResult};
+use crate::job_runner;
 use crate::models::ModelLayout;
 use crate::paths;
 use rusqlite::params;
@@ -43,18 +44,20 @@ pub struct JobEvent {
     pub error: String,
 }
 
-/// 长驻转写工作线程：轮询 pending 任务，逐个执行。
+/// 长驻转写工作线程：轮询 pending 任务，逐个交给**子进程**执行。
 pub struct TranscribeWorker {
     pub db: Arc<Db>,
     pub data_root: PathBuf,
     pub app: tauri::AppHandle,
     pub cancel: Arc<AtomicBool>,
+    /// 正在跑的子进程（录音 id, pid）。取消时需要杀掉它才能立即停下。
+    pub running: Arc<std::sync::Mutex<Option<(i64, u32)>>>,
 }
 
-struct JobInfo {
-    id: i64,
-    recording_id: i64,
-    file_path: String,
+pub struct JobInfo {
+    pub id: i64,
+    pub recording_id: i64,
+    pub file_path: String,
 }
 
 impl TranscribeWorker {
@@ -112,67 +115,13 @@ impl TranscribeWorker {
     }
 
     fn run_job(&self, job: JobInfo) {
-        self.cancel.store(false, Ordering::Relaxed);
         let outcome = self.transcribe_one(&job);
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let (job_status, rec_status, progress, error) = match outcome {
-            Ok(rows) => {
-                let mut conn = self.db.conn.lock().unwrap();
-                let tx = conn.transaction().unwrap();
-                {
-                    tx.execute("DELETE FROM segments WHERE recording_id = ?1", [job.recording_id])
-                        .unwrap();
-                    let mut stmt = tx
-                        .prepare(
-                            "INSERT INTO segments(recording_id, start_ms, end_ms, text, chars)
-                             VALUES(?1,?2,?3,?4,?5)",
-                        )
-                        .unwrap();
-                    for r in &rows {
-                        stmt.execute(params![
-                            job.recording_id,
-                            r.start_ms,
-                            r.end_ms,
-                            r.text,
-                            r.chars
-                        ])
-                        .unwrap();
-                    }
-                }
-                tx.execute(
-                    "UPDATE recordings SET status='done', updated_at=?1 WHERE id=?2",
-                    params![now, job.recording_id],
-                )
-                .unwrap();
-                tx.execute(
-                    "UPDATE jobs SET status='done', progress=1.0, updated_at=?1 WHERE id=?2",
-                    params![now, job.id],
-                )
-                .unwrap();
-                tx.commit().unwrap();
-                drop(conn);
-                ("done", "done", 1.0, "".to_string())
-            }
-            Err(e) => {
-                let canceled = self.cancel.load(Ordering::Relaxed);
-                let status = if canceled { "canceled" } else { "failed" };
-                let rec_status = if canceled { "imported" } else { "failed" };
-                let conn = self.db.conn.lock().unwrap();
-                let _ = conn.execute(
-                    "UPDATE jobs SET status=?1, error=?2, updated_at=?3 WHERE id=?4",
-                    params![status, e.msg, now, job.id],
-                );
-                let _ = conn.execute(
-                    "UPDATE recordings SET status=?1, updated_at=?2 WHERE id=?3",
-                    params![rec_status, now, job.recording_id],
-                );
-                drop(conn);
-                (status, rec_status, 0.0, e.msg)
-            }
-        };
+        let canceled = self.cancel.load(Ordering::Relaxed);
+        let (job_status, rec_status, progress, error) =
+            finalize_job(&self.db, &job, outcome, canceled);
         let _ = job_status;
         let _ = rec_status;
-        self.emit(job.recording_id, job_status, progress, &error);
+        self.emit(job.recording_id, &job_status, progress, &error);
     }
 
     fn emit(&self, recording_id: i64, status: &str, progress: f64, error: &str) {
@@ -187,31 +136,238 @@ impl TranscribeWorker {
         );
     }
 
-    /// 单条录音完整转写流水线，返回分段行
-    fn transcribe_one(&self, job: &JobInfo) -> AppResult<Vec<SegRow>> {
+    /// 在**子进程**里跑完整转写流水线，返回分段行。
+    ///
+    /// 为什么是子进程：原生识别引擎在特定内容上会破坏栈保护并让进程直接退出，
+    /// 放在子进程里跑，崩溃只表现为非零退出码，应用本身不受影响。
+    ///
+    /// 进度：子进程按行输出 JSON（`job_runner::ProgressLine`），这里逐行解析后转发为 Tauri 事件。
+    /// 取消：把 300ms 内的进度静默视作活跃检查点；同时父进程杀掉子进程即可立即停止。
+    fn transcribe_one(&self, job: &JobInfo) -> AppResult<Vec<job_runner::SegRow>> {
         let cache = paths::cache_dir(&self.data_root);
-        let cancel = self.cancel.clone();
-        let app = self.app.clone();
+        std::fs::create_dir_all(&cache)?;
+        let out_json = cache.join(format!("job-{}.json", job.id));
+        let _ = std::fs::remove_file(&out_json);
+
+        let exe = child_exe_path()?;
+        let mut child = Command::new(&exe)
+            .arg(job.recording_id.to_string())
+            .arg(&job.file_path)
+            .arg(paths::models_dir(&self.data_root))
+            .arg(&cache)
+            .arg(&out_json)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                err(format!(
+                    "启动转写子进程失败：{e}（预期位置 {}）",
+                    exe.display()
+                ))
+            })?;
+
+        let pid = child.id();
+        *self.running.lock().unwrap() = Some((job.recording_id, pid));
+        // 本任务开始，清掉上一轮可能残留的取消标记
+        self.cancel.store(false, Ordering::Relaxed);
+
+        // 进度行读取独立成线程：主线程要同时轮询退出状态与取消请求
+        let stdout = child.stdout.take();
         let recording_id = job.recording_id;
-        run_pipeline(
-            std::path::Path::new(&job.file_path),
-            &paths::models_dir(&self.data_root),
-            &cache,
-            job.recording_id,
-            &cancel,
-            move |progress| {
-                use tauri::Emitter;
-                let _ = app.emit(
-                    "job://progress",
-                    JobEvent {
-                        recording_id,
-                        status: "running".into(),
-                        progress,
-                        error: String::new(),
-                    },
-                );
-            },
-        )
+        let app = self.app.clone();
+        let reader = std::thread::spawn(move || {
+            let Some(out) = stdout else { return };
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                match serde_json::from_str::<job_runner::ProgressLine>(line.trim()) {
+                    Ok(job_runner::ProgressLine::Progress { value }) => {
+                        use tauri::Emitter;
+                        let _ = app.emit(
+                            "job://progress",
+                            JobEvent {
+                                recording_id,
+                                status: "running".into(),
+                                progress: value,
+                                error: String::new(),
+                            },
+                        );
+                    }
+                    Ok(job_runner::ProgressLine::Error { msg }) => eprintln!("[转写] {msg}"),
+                    // 非协议行（原生库偶发打印）忽略即可
+                    Err(_) => {}
+                }
+            }
+        });
+
+        // 每 300ms 检查一次：子进程是否结束 / 用户是否取消
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {}
+                Err(e) => {
+                    *self.running.lock().unwrap() = None;
+                    return Err(err(format!("等待转写子进程失败：{e}")));
+                }
+            }
+            if self.cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                *self.running.lock().unwrap() = None;
+                let _ = std::fs::remove_file(&out_json);
+                return Err(err("已取消"));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        *self.running.lock().unwrap() = None;
+        let _ = reader.join();
+        // 收集子进程 stderr，崩溃时用于说明原因（截断避免过长）
+        let stderr_tail = child
+            .stderr
+            .take()
+            .map(|mut s| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf.chars().take(400).collect::<String>()
+            })
+            .unwrap_or_default();
+
+        // 先读结果文件：子进程可能以非零码退出但仍写下了可读错误
+        let payload = std::fs::read_to_string(&out_json).ok();
+        let _ = std::fs::remove_file(&out_json);
+
+        if let Some(raw) = payload {
+            match serde_json::from_str::<job_runner::PipelineOutput>(&raw) {
+                Ok(job_runner::PipelineOutput::Rows(rows)) => {
+                    if !status.success() {
+                        // 有结果但退出码非零：仍按成功处理，避免白跑一趟
+                        eprintln!("[转写] 子进程退出码异常但已产出结果，按成功处理");
+                    }
+                    if rows.is_empty() {
+                        return Err(err("未识别到任何语音内容"));
+                    }
+                    return Ok(rows);
+                }
+                Ok(job_runner::PipelineOutput::Failure { error }) => return Err(err(error)),
+                Err(_) => {
+                    // 结果文件损坏（例如子进程写到一半被打断）
+                }
+            }
+        }
+
+        Err(err(job_runner::explain_child_exit(status.code(), &stderr_tail)))
+    }
+}
+
+/// 定位转写子进程可执行文件。
+///
+/// 查找顺序（命中即返回）：
+/// 1. 与主程序同目录 —— 开发时 `cargo build` 把 bin 与 lib 放在同一 profile 目录；
+/// 2. 上一级目录 —— 从 `target/<profile>/deps/` 运行测试时，bin 在上一级；
+/// 3. `<主程序目录>/Resources/` —— Tauri 打包（bundle.resources）把外部二进制放这里，
+///    Windows 上形如 `C:\Program Files\SoundTrace\Resources\st-transcribe.exe`。
+fn child_exe_path() -> AppResult<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| err(format!("无法定位当前可执行文件：{e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| err("无法定位当前可执行文件所在目录"))?;
+    let name = if cfg!(windows) {
+        "st-transcribe.exe"
+    } else {
+        "st-transcribe"
+    };
+
+    let mut candidates: Vec<PathBuf> = vec![dir.join(name)];
+    if let Some(parent) = dir.parent() {
+        candidates.push(parent.join(name));
+    }
+    candidates.push(dir.join("Resources").join(name));
+
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.clone());
+        }
+    }
+    Err(err(format!(
+        "找不到转写引擎。开发时请执行 `cargo build`；打包前请运行 `node tools/build-sidecar.mjs`。\
+         已查找：{}",
+        candidates
+            .iter()
+            .map(|c| c.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    )))
+}
+
+/// 把一次转写的结果落库，返回 (job 状态, 录音状态, 进度, 错误文本) 供事件推送。
+///
+/// 成功：整批替换该录音的分段并把两边都置为 done。
+/// 失败：区分「用户取消」（录音回到 imported，可重新排队）与「引擎崩溃/报错」
+/// （录音置为 failed 并保留原因，用户能看到为什么没成）。崩溃由子进程隔离后走到这里，
+/// 因此应用不会闪退，任务状态也能正确收尾。
+pub fn finalize_job(
+    db: &Arc<Db>,
+    job: &JobInfo,
+    outcome: AppResult<Vec<job_runner::SegRow>>,
+    canceled: bool,
+) -> (String, String, f64, String) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    match outcome {
+        Ok(rows) => {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                tx.execute(
+                    "DELETE FROM segments WHERE recording_id = ?1",
+                    [job.recording_id],
+                )
+                .unwrap();
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO segments(recording_id, start_ms, end_ms, text, chars)
+                         VALUES(?1,?2,?3,?4,?5)",
+                    )
+                    .unwrap();
+                for r in &rows {
+                    stmt.execute(params![
+                        job.recording_id,
+                        r.start_ms,
+                        r.end_ms,
+                        r.text,
+                        r.chars
+                    ])
+                    .unwrap();
+                }
+            }
+            tx.execute(
+                "UPDATE recordings SET status='done', updated_at=?1 WHERE id=?2",
+                params![now, job.recording_id],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE jobs SET status='done', progress=1.0, updated_at=?1 WHERE id=?2",
+                params![now, job.id],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            ("done".into(), "done".into(), 1.0, String::new())
+        }
+        Err(e) => {
+            let status = if canceled { "canceled" } else { "failed" };
+            let rec_status = if canceled { "imported" } else { "failed" };
+            let conn = db.conn.lock().unwrap();
+            let _ = conn.execute(
+                "UPDATE jobs SET status=?1, error=?2, updated_at=?3 WHERE id=?4",
+                params![status, e.msg, now, job.id],
+            );
+            let _ = conn.execute(
+                "UPDATE recordings SET status=?1, updated_at=?2 WHERE id=?3",
+                params![rec_status, now, job.recording_id],
+            );
+            (status.into(), rec_status.into(), 0.0, e.msg)
+        }
     }
 }
 
@@ -329,6 +485,8 @@ pub fn run_pipeline(
     Ok(rows)
 }
 
+/// 转写结果分段。与 `job_runner::SegRow` 字段一致，后者用于父子进程间序列化。
+#[derive(Clone)]
 pub struct SegRow {
     pub start_ms: i64,
     pub end_ms: i64,

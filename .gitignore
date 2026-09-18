@@ -26,3 +26,4 @@ dist-ssr
 testdata/
 tools/icon-gen/target/
 .zcode/
+src-tauri/binaries/

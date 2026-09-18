@@ -36,6 +36,80 @@ fn models_root() -> PathBuf {
         .unwrap_or_else(|_| dirs::home_dir().unwrap().join("SoundTrace").join("models"))
 }
 
+/// 隔离性质测试：已知会让原生识别引擎崩溃的音频，交给**子进程**跑时，
+/// 子进程会异常退出，而父进程（跑这个测试的进程）必须完好无损。
+///
+/// 这是整个子进程架构存在的理由——如果哪天有人把转写改回进程内执行，
+/// 这个测试会以「测试进程自己被 0xc0000409 带走」的方式失败。
+#[test]
+fn child_process_isolates_native_crash() {
+    let Some(clip) = std::env::var("ST_CRASH_CLIP").ok().map(PathBuf::from) else {
+        eprintln!("跳过：未设置 ST_CRASH_CLIP（指向已知会崩溃的音频）");
+        return;
+    };
+    if !clip.is_file() {
+        eprintln!("跳过：{} 不存在", clip.display());
+        return;
+    }
+    let mroot = models_root();
+    if !soundtrace_lib::models::ModelLayout::new(mroot.clone()).all_ready() {
+        eprintln!("跳过：模型未就绪");
+        return;
+    }
+
+    // 子进程可执行文件就在测试 exe 的同级目录（target/debug/deps/ 的上一级）
+    let test_exe = std::env::current_exe().unwrap();
+    let bin_dir = test_exe.parent().unwrap().parent().unwrap();
+    let child_exe = bin_dir.join(if cfg!(windows) {
+        "st-transcribe.exe"
+    } else {
+        "st-transcribe"
+    });
+    if !child_exe.is_file() {
+        eprintln!("跳过：找不到子进程 {}（先 cargo build）", child_exe.display());
+        return;
+    }
+
+    let cache = std::env::temp_dir().join("st-crash-isolation");
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cache).unwrap();
+    let out_json = cache.join("out.json");
+
+    println!("拉起子进程处理已知崩溃片段…（父进程存活即为通过）");
+    let output = std::process::Command::new(&child_exe)
+        .arg("1")
+        .arg(&clip)
+        .arg(&mroot)
+        .arg(&cache)
+        .arg(&out_json)
+        .output()
+        .expect("无法启动子进程");
+
+    println!("子进程退出码：{:?}", output.status.code());
+    println!(
+        "子进程 stderr：{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    assert!(
+        !output.status.success(),
+        "该片段本应让原生层崩溃，子进程却正常退出——样本失效或缺陷已修，请更新样本"
+    );
+    // 崩溃前已发出的进度应当留在 stdout 里（说明进度是流式的）
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let has_progress = stdout.lines().any(|l| l.contains("\"type\":\"progress\""));
+    println!("崩溃前是否已输出进度：{has_progress}");
+    assert!(has_progress, "崩溃前的进度应已通过 stdout 送出");
+
+    // 关键断言：走到这里说明父进程没被带走
+    println!("✅ 父进程存活：原生崩溃已被隔离在子进程内");
+
+    // 退出码可翻译成用户可读原因
+    let msg = soundtrace_lib::job_runner::explain_child_exit(output.status.code(), &String::from_utf8_lossy(&output.stderr));
+    println!("给用户看的原因：{msg}");
+    assert!(!msg.is_empty());
+}
+
 /// 隔离探针：把 VAD 与识别器分开跑，定位原生崩溃到底发生在哪一层。
 /// 用法：ST_PROBE_WAV=xxx.wav cargo test --test real_library probe_vad_or_asr -- --nocapture
 #[test]
