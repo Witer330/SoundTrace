@@ -1,5 +1,7 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import logoUrl from "./assets/logo.svg";
 import { isTauri, type JobEvent } from "./api";
 import { selectPendingCount, useAppStore } from "./store";
@@ -133,12 +135,23 @@ export default function App() {
   }, [initTheme, refreshAll]);
 
   // 任务状态变化时刷新库列表 + 队列（列表页与工作台都能看到状态流转）。
-  // running 的进度事件每秒可达两次，用定时器合并，避免批量入队时抖动 N 次全量查询。
+  // running 的中间进度只存在于事件里（jobs 表落库时已是终值），就地 patch store，
+  // 不打后端全量查询；状态变化事件仍用定时器合并，避免批量入队时抖动 N 次刷新。
   useEffect(() => {
     if (!isTauri()) return;
     let timer: number | undefined;
     const un = listen<JobEvent>("job://progress", (e) => {
-      if (e.payload.status === "running" && e.payload.progress > 0) return;
+      const p = e.payload;
+      if (p.status === "running" && p.progress > 0) {
+        useAppStore.setState((s) => ({
+          jobs: s.jobs.map((j) =>
+            j.recordingId === p.recordingId && j.status === "running"
+              ? { ...j, progress: p.progress }
+              : j,
+          ),
+        }));
+        return;
+      }
       if (timer !== undefined) return;
       timer = window.setTimeout(() => {
         timer = undefined;
@@ -152,6 +165,53 @@ export default function App() {
     };
   }, [refreshJobs]);
 
+  // 有任务在跑时拦截关窗：转写子进程会随退出被杀、纪要生成会中断，先问一声。
+  // 注意：注册 onCloseRequested 后由 JS 侧调 destroy() 完成关闭，
+  // capabilities 里的 core:window:allow-destroy 是它的前置条件。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let asking = false;
+    const un = getCurrentWindow().onCloseRequested(async (event) => {
+      const st = useAppStore.getState();
+      const transcribing = st.jobs.some((j) => j.status === "running" || j.status === "pending");
+      if (!transcribing && st.summarizingId === null) return;
+      if (asking) {
+        // 确认框已经开着，忽略连点，等用户答复
+        event.preventDefault();
+        return;
+      }
+      asking = true;
+      const ok = await confirm(
+        transcribing
+          ? "有录音正在排队或转写，退出会中断任务，且不会自动续跑。\n确定要退出吗？"
+          : "AI 纪要正在生成，退出会中断本次生成。\n确定要退出吗？",
+        { title: "声迹 SoundTrace", kind: "warning", okLabel: "退出", cancelLabel: "取消" },
+      );
+      asking = false;
+      if (!ok) event.preventDefault();
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
+
+  // 纪要生成是后台线程（没有 job 行），这里统一收尾：清掉全局生成态 + 刷新列表，
+  // 这样不管用户停在哪个页面，工作台/录音库的「有纪要」标记都能及时出现。
+  useEffect(() => {
+    if (!isTauri()) return;
+    const un = listen<{ recordingId: number; ok: boolean; error: string }>(
+      "summarize://done",
+      (e) => {
+        const st = useAppStore.getState();
+        if (st.summarizingId === e.payload.recordingId) st.setSummarizingId(null);
+        if (e.payload.ok) void st.refreshRecordings();
+      },
+    );
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
+
   return (
     <div className="h-full flex">
       <Sidebar />
@@ -160,7 +220,9 @@ export default function App() {
           {view.kind === "workbench" && <WorkbenchView />}
           {view.kind === "library" && <LibraryView />}
           {view.kind === "search" && <SearchView />}
-          {view.kind === "detail" && <DetailView key={view.id} id={view.id} seekMs={view.seekMs} />}
+          {view.kind === "detail" && (
+            <DetailView key={view.id} id={view.id} seekMs={view.seekMs} from={view.from} />
+          )}
           {view.kind === "settings" && <SettingsView />}
         </ErrorBoundary>
       </main>

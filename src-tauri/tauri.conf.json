@@ -32,7 +32,8 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "binaries/st-transcribe.exe"
+      "binaries/st-transcribe.exe",
+      "binaries/st-diarize.exe"
     ],
     "icon": [
       "icons/32x32.png",

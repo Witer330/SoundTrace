@@ -3,7 +3,8 @@
 //! 存在的唯一理由：原生识别引擎在特定音频内容上会破坏栈保护并让进程直接退出。
 //! 把它放到子进程后，崩溃只体现为一个非零退出码，父进程（Tauri 应用）不受影响。
 //!
-//! 用法：`st-transcribe <recording_id> <audio_file> <models_root> <cache_dir> <out_json>`
+//! 用法：`st-transcribe <recording_id> <audio_file> <models_root> <cache_dir> <out_json> [asr_threads]`
+//! 末位 `asr_threads` 可省略（等价于 `auto`）：见 `transcribe::parse_threads`。
 //! stdout 每行一个 JSON 进度对象（见 `job_runner::ProgressLine`）；
 //! 结束时把分段数组（成功）或 `{"error": "..."}`（失败）写入 `<out_json>`。
 //!
@@ -14,7 +15,8 @@ use std::sync::atomic::AtomicBool;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 6 {
+    // 第 6 个参数（asr_threads）可选：省略与旧版父进程兼容
+    if args.len() != 6 && args.len() != 7 {
         eprintln!("用法: {} {}", args[0], soundtrace_lib::job_runner::CHILD_ARG_USAGE);
         std::process::exit(2);
     }
@@ -29,6 +31,7 @@ fn main() {
     let models_root = std::path::PathBuf::from(&args[3]);
     let cache_dir = std::path::PathBuf::from(&args[4]);
     let out_json = std::path::PathBuf::from(&args[5]);
+    let asr_threads = args.get(6).map(String::as_str).unwrap_or("auto");
 
     let cancel = AtomicBool::new(false);
     let stdout = std::io::stdout();
@@ -37,6 +40,7 @@ fn main() {
         &models_root,
         &cache_dir,
         recording_id,
+        asr_threads,
         &cancel,
         |value| {
             // 进度按行输出，父进程逐行解析；不缓存，保证崩溃前已发出的进度都送达

@@ -127,6 +127,8 @@ export interface TranscriptSegment {
   speaker: number | null;
   /** 是否被手工改过 */
   edited: boolean;
+  /** 说话人是否被手工标/改/清过：自动分离只回填该标记为 false 的段 */
+  speakerEdited: boolean;
 }
 
 export async function listSegments(recordingId: number): Promise<TranscriptSegment[]> {
@@ -148,6 +150,42 @@ export async function mergeSegments(ids: number[]): Promise<number> {
 
 export async function setSegmentSpeaker(id: number, speaker: number | null): Promise<void> {
   await invoke("set_segment_speaker", { id, speaker });
+}
+
+/** 合并说话人：把 from 簇的所有段并入 to 簇（手工修正拆错的人） */
+export async function mergeSpeakers(recordingId: number, from: number, to: number): Promise<number> {
+  return invoke("merge_speakers", { recordingId, from, to });
+}
+
+// ---------- 说话人自动分离（V2） ----------
+
+export interface DiarEvent {
+  recordingId: number;
+  status: "running" | "done" | "failed" | "canceled";
+  progress: number;
+  error: string;
+  /** done 时的互异说话人数 */
+  numSpeakers: number;
+}
+
+/** 对一条录音跑自动分离（人数必填，锁人数是产品路径） */
+export async function runDiarize(recordingId: number, numClusters: number): Promise<void> {
+  await invoke("run_diarize", { recordingId, numClusters });
+}
+
+export async function cancelDiarize(recordingId: number): Promise<void> {
+  await invoke("cancel_diarize", { recordingId });
+}
+
+/** 分离运行状态（全局最多一个）：recordingId 非空表示正在跑。
+ *  进度记在后端槽里，页面切走再回来也能查到真实状态。 */
+export interface DiarizeRunState {
+  recordingId: number | null;
+  progress: number;
+}
+
+export async function diarizeStatus(): Promise<DiarizeRunState> {
+  return invoke("diarize_status");
 }
 
 /** 从时间中点把一段拆成两段，返回新段 id */

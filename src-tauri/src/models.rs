@@ -48,6 +48,11 @@ const VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 const PUNCT_TGZ_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2";
+// 说话人分离（V2）：pyannote 分段 + CAM++ 声纹。下载 URL 已核实（2026-09-19）
+const SEG_TGZ_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+const CAMPPLUS_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx";
 
 impl ModelLayout {
     pub fn new(models_root: PathBuf) -> Self {
@@ -68,6 +73,14 @@ impl ModelLayout {
             .join("punct")
             .join("sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8")
             .join("model.int8.onnx")
+    }
+    /// 说话人分离的分段模型（pyannote，fp32）
+    pub fn seg_model(&self) -> PathBuf {
+        self.root.join("seg").join("model.onnx")
+    }
+    /// 说话人声纹模型（3D-Speaker CAM++，中文 16k）
+    pub fn speaker_model(&self) -> PathBuf {
+        self.root.join("speaker").join("campplus_zh_16k.onnx")
     }
 
     pub fn status(&self) -> Vec<ModelStatus> {
@@ -101,16 +114,74 @@ impl ModelLayout {
                 },
                 total_bytes: 75_497_472,
             },
+            ModelStatus {
+                id: "seg".into(),
+                name: "pyannote（说话人分段 · 分离用）".into(),
+                ready: self.seg_model().is_file(),
+                present_bytes: file_size(&self.seg_model()).unwrap_or(0),
+                // tar.bz2 包整体大小（包内含 fp32/int8 两份，安装取 fp32 的 model.onnx）
+                total_bytes: 6_958_444,
+            },
+            ModelStatus {
+                id: "campplus".into(),
+                name: "CAM++（声纹提取 · 分离用）".into(),
+                ready: self.speaker_model().is_file(),
+                present_bytes: file_size(&self.speaker_model()).unwrap_or(0),
+                total_bytes: 28_281_138,
+            },
         ]
     }
 
+    /// 转写就绪（不含说话人模型——转写不依赖它们）
     pub fn all_ready(&self) -> bool {
-        self.status().iter().all(|m| m.ready)
+        self.asr_model().is_file()
+            && self.asr_tokens().is_file()
+            && self.vad_model().is_file()
+            && self.punct_model().is_file()
+    }
+
+    /// 说话人分离就绪
+    pub fn speaker_ready(&self) -> bool {
+        self.seg_model().is_file() && self.speaker_model().is_file()
     }
 }
 
 fn file_size(p: &Path) -> Option<u64> {
     fs::metadata(p).ok().map(|m| m.len())
+}
+
+/// 在目录的浅层（含一层子目录）里找指定文件名
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_file() && p.file_name().map(|n| n == name).unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            for inner in fs::read_dir(&p).ok()?.flatten() {
+                let ip = inner.path();
+                if ip.is_file() && ip.file_name().map(|n| n == name).unwrap_or(false) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 删除目录下的一层子目录（解压 tar 后的清理；失败的静默忽略，不影响就绪判定）
+fn cleanup_extracted_dirs(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let _ = fs::remove_dir_all(&p);
+            }
+        }
+    }
 }
 
 /// 后台线程下载缺失模型，通过事件汇报进度：models://progress / models://done
@@ -175,6 +246,38 @@ pub fn install_models(
                 if !layout.punct_model().is_file() {
                     return Err(err("解压后未找到 model.int8.onnx"));
                 }
+            }
+            "seg" => {
+                let seg_dir = layout.root.join("seg");
+                fs::create_dir_all(&seg_dir)?;
+                let tbz = seg_dir.join("seg.tar.bz2");
+                download_file(emit, "seg", SEG_TGZ_URL, &tbz)?;
+                let out = Command::new("tar")
+                    .args(["-xjf"])
+                    .arg(&tbz)
+                    .arg("-C")
+                    .arg(&seg_dir)
+                    .output()
+                    .map_err(|e| err(format!("调用 tar 失败: {e}")))?;
+                if !out.status.success() {
+                    return Err(err(format!(
+                        "解压失败: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )));
+                }
+                let _ = fs::remove_file(&tbz);
+                // 包内是 <子目录>/model.onnx：把它挪到 seg/model.onnx，再清掉解压残留
+                if !layout.seg_model().is_file() {
+                    let found = find_file(&seg_dir, "model.onnx")
+                        .ok_or_else(|| err("解压后未找到 model.onnx"))?;
+                    fs::rename(&found, layout.seg_model())?;
+                }
+                cleanup_extracted_dirs(&seg_dir);
+            }
+            "campplus" => {
+                let spk_dir = layout.root.join("speaker");
+                fs::create_dir_all(&spk_dir)?;
+                download_file(emit, "campplus", CAMPPLUS_URL, &layout.speaker_model())?;
             }
             other => return Err(err(format!("未知模型: {other}"))),
         }

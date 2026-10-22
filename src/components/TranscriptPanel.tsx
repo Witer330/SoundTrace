@@ -8,15 +8,19 @@ import {
   getSpeakerNames,
   listSegments,
   mergeSegments,
+  mergeSpeakers,
   setSegmentSpeaker,
   setSpeakerNames,
   splitSegment as splitSegmentApi,
   transcribeRecording,
   updateSegment,
+  type DiarEvent,
   type JobEvent,
   type TranscriptSegment,
 } from "../api";
 import { formatMsTime, type Recording } from "../types";
+import { countText } from "../utils/wordCount";
+import { splitHighlight } from "./Highlight";
 
 /** 解析 chars JSON：[[char, ms], ...] */
 function parseChars(chars: string): [string, number][] {
@@ -26,26 +30,6 @@ function parseChars(chars: string): [string, number][] {
   } catch {
     return [];
   }
-}
-
-/** 把文本按搜索词切分为普通/命中片段 */
-function splitHighlight(text: string, query: string): { t: string; hit: boolean }[] {
-  if (!query) return [{ t: text, hit: false }];
-  const out: { t: string; hit: boolean }[] = [];
-  const lower = text.toLowerCase();
-  const q = query.toLowerCase();
-  let i = 0;
-  while (i < text.length) {
-    const idx = lower.indexOf(q, i);
-    if (idx === -1) {
-      out.push({ t: text.slice(i), hit: false });
-      break;
-    }
-    if (idx > i) out.push({ t: text.slice(i, idx), hit: false });
-    out.push({ t: text.slice(idx, idx + q.length), hit: true });
-    i = idx + q.length;
-  }
-  return out;
 }
 
 const SPEAKER_TONE = ["text-spk-1", "text-spk-2", "text-spk-3"] as const;
@@ -290,10 +274,12 @@ interface Props {
   seek: (sec: number) => void;
   /** 状态变化后通知父组件刷新录音元数据 */
   onChanged: () => void;
+  /** 有未保存的编辑草稿时通知父组件（用于离开前的确认拦截） */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 /** 转写稿面板：开始/取消转写、进度、点字跳转、跟随播放、稿内搜索、编辑与说话人标注 */
-export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: Props) {
+export default function TranscriptPanel({ rec, currentTime, seek, onChanged, onDirtyChange }: Props) {
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [status, setStatus] = useState(rec.status);
@@ -308,13 +294,24 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
   const [dirty, setDirty] = useState(false);
   const [editingName, setEditingName] = useState<number | null>(null);
   const [nameDraft, setNameDraft] = useState("");
+  // 合并说话人（修正自动分离把同一人拆成多簇）：from 簇整体并入 to 簇
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [mergeFrom, setMergeFrom] = useState<number | null>(null);
+  const [mergeTo, setMergeTo] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // 把脏标记转发给父组件（详情页据此拦截切页签/返回）
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   const reload = useCallback(() => {
     return listSegments(rec.id)
       .then((segs) => {
         setSegments(segs);
         setLoaded(true);
+        // 分段已重建（合并/拆分/重新转写），行内未保存的草稿已随旧行消失
+        setDirty(false);
       })
       .catch((e) => {
         setError(errMsg(e));
@@ -377,6 +374,19 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rec.id]);
 
+  // 自动分离完成：分段与说话人名都可能变了，刷新两者
+  useEffect(() => {
+    const un = listen<DiarEvent>("diar://progress", (event) => {
+      const p = event.payload;
+      if (p.recordingId !== rec.id || p.status !== "done") return;
+      void reload();
+      getSpeakerNames(rec.id).then(setNames).catch(() => undefined);
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [rec.id, reload]);
+
   const speakerName = useCallback(
     (n: number) => names[String(n)] || `说话人${n}`,
     [names],
@@ -392,6 +402,14 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
     () => (speakerFilter === "all" ? segments : segments.filter((s) => s.speaker === speakerFilter)),
     [segments, speakerFilter],
   );
+
+  // 全稿字数：从 text 派生（chars 是时间轴 JSON，编辑后会被清空，不可靠）；
+  // 只随分段变化重算，与逐帧播放渲染隔离
+  const wordCount = useMemo(() => {
+    let n = 0;
+    for (const s of segments) n += countText(s.text).words;
+    return n;
+  }, [segments]);
 
   const matches = useMemo(() => {
     if (!search.trim()) return [];
@@ -505,6 +523,27 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
     [refreshEdited],
   );
 
+  /** 合并说话人：把 from 簇并入 to 簇（修正自动分离把同一人拆成多簇） */
+  const applyMerge = useCallback(() => {
+    if (!mergeFrom || !mergeTo || mergeFrom === mergeTo) return;
+    const count = segments.filter((s) => s.speaker === mergeFrom).length;
+    const ok = window.confirm(
+      `把「${speakerName(mergeFrom)}」的 ${count} 段并入「${speakerName(mergeTo)}」？\n\n` +
+        `合并是手工修正：这些段之后的自动分离不会再覆盖它们。`,
+    );
+    if (!ok) return;
+    mergeSpeakers(rec.id, mergeFrom, mergeTo)
+      .then(() => reload())
+      .then(() => getSpeakerNames(rec.id).then(setNames))
+      .then(refreshEdited)
+      .then(() => {
+        setMergeOpen(false);
+        setMergeFrom(null);
+        setMergeTo(null);
+      })
+      .catch((e) => setError(errMsg(e)));
+  }, [mergeFrom, mergeTo, segments, speakerName, rec.id, reload, refreshEdited]);
+
   /** 从时间中点把一段拆成两段（后端原子操作，两半各自保留时间轴） */
   const splitSegment = useCallback(
     (index: number) => {
@@ -530,8 +569,11 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
       <div className="flex items-center gap-2 px-4 py-2.5 border-b border-ink-800 flex-wrap">
         <div className="text-mist-300 text-sm font-medium">转写稿</div>
         {status === "done" && segments.length > 0 && (
-          <span className="text-[11px] text-ink-500">
-            {segments.length} 段
+          <span
+            className="text-[11px] text-ink-500"
+            title="中文逐字计数，英文/数字按词计数，不含标点"
+          >
+            {segments.length} 段 · {wordCount.toLocaleString()} 字
             {editedCount > 0 && <span className="ml-1.5 text-st-warn">· 手工修改 {editedCount} 处</span>}
           </span>
         )}
@@ -589,6 +631,19 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
                     改名
                   </button>
                 )}
+                {speakerIds.length >= 2 && (
+                  <button
+                    className={`text-xs px-1.5 py-0.5 rounded ${
+                      mergeOpen
+                        ? "bg-cyan-accent/20 text-cyan-accent"
+                        : "text-mist-400 hover:text-cyan-accent"
+                    }`}
+                    onClick={() => setMergeOpen((v) => !v)}
+                    title="自动分离把同一人拆成了多个？在这里把它们并成一个"
+                  >
+                    合并
+                  </button>
+                )}
               </>
             )}
 
@@ -636,6 +691,48 @@ export default function TranscriptPanel({ rec, currentTime, seek, onChanged }: P
           </>
         )}
       </div>
+
+      {/* 合并说话人（自动分离把同一人拆成多簇时的一击修正） */}
+      {mergeOpen && speakerIds.length >= 2 && (
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-ink-800 text-xs flex-wrap">
+          <span className="text-ink-500">把</span>
+          <select
+            className="text-xs py-1"
+            value={mergeFrom ?? ""}
+            onChange={(e) => setMergeFrom(e.target.value ? Number(e.target.value) : null)}
+          >
+            <option value="">选择说话人…</option>
+            {speakerIds.map((n) => (
+              <option key={n} value={n}>
+                {speakerName(n)}
+              </option>
+            ))}
+          </select>
+          <span className="text-ink-500">并入</span>
+          <select
+            className="text-xs py-1"
+            value={mergeTo ?? ""}
+            onChange={(e) => setMergeTo(e.target.value ? Number(e.target.value) : null)}
+          >
+            <option value="">选择说话人…</option>
+            {speakerIds
+              .filter((n) => n !== mergeFrom)
+              .map((n) => (
+                <option key={n} value={n}>
+                  {speakerName(n)}
+                </option>
+              ))}
+          </select>
+          <button
+            className="px-2.5 py-1 rounded bg-gradient-to-r from-teal-accent to-cyan-accent text-ink-950 font-medium disabled:opacity-50"
+            disabled={!mergeFrom || !mergeTo || mergeFrom === mergeTo}
+            onClick={applyMerge}
+          >
+            合并
+          </button>
+          <span className="text-[11px] text-ink-500">被并入的段会标记为手工修正，之后自动分离不再覆盖</span>
+        </div>
+      )}
 
       {/* 状态区 */}
       {(status === "imported" || status === "failed") && (

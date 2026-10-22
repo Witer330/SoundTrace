@@ -122,6 +122,7 @@ fn import_dedup_transcribe_search_export() {
         &models_root,
         &paths::cache_dir(&root),
         rec.id,
+        "auto",
         &cancel,
         |_| {},
     )

@@ -27,3 +27,11 @@ testdata/
 tools/icon-gen/target/
 .zcode/
 src-tauri/binaries/
+
+# 环境变量文件
+.env
+.env.*
+!.env.example
+
+# Tauri 生成目录
+src-tauri/gen/

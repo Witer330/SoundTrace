@@ -145,18 +145,23 @@ body {
   background: transparent;
 }
 
-/* 通用输入控件 */
-input[type="text"],
-input[type="password"],
-select,
-textarea {
-  @apply bg-ink-850 border border-ink-700 rounded-lg px-3 py-2 text-sm text-mist-200
-    placeholder:text-ink-500 focus:outline-none focus:border-cyan-accent/60
-    focus:ring-1 focus:ring-cyan-accent/30 transition-colors;
-}
+/* 通用输入控件。
+ * 必须放进 @layer base：未分层规则会压过 utilities 层，导致组件上的
+ * pl-9 等内边距类全部失效（搜索框图标与占位文字重叠就是这个原因） */
+@layer base {
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  select,
+  textarea {
+    @apply bg-ink-850 border border-ink-700 rounded-lg px-3 py-2 text-sm text-mist-200
+      placeholder:text-ink-500 focus:outline-none focus:border-cyan-accent/60
+      focus:ring-1 focus:ring-cyan-accent/30 transition-colors;
+  }
 
-button {
-  @apply cursor-pointer select-none;
+  button {
+    @apply cursor-pointer select-none;
+  }
 }
 
 /* Markdown 纪要排版（未安装 typography 插件，prose-* 不生效，故显式定义） */

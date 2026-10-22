@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store";
+import { formatMsTime } from "../types";
 
 interface WaveformProps {
   peaks: number[];
@@ -39,6 +40,8 @@ export default function Waveform({
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draggingRef = useRef(false);
+  // 悬停/拖动时显示目标时间戳
+  const [hover, setHover] = useState<{ x: number; sec: number } | null>(null);
   // 主题变化时重绘（暂停状态下 currentTime 不变，否则波形会停在旧配色）
   const theme = useAppStore((s) => s.theme);
 
@@ -96,6 +99,17 @@ export default function Waveform({
     return () => window.removeEventListener("resize", onResize);
   }, [draw]);
 
+  const posFromClientX = useCallback(
+    (clientX: number): { x: number; sec: number } | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || durationSec <= 0) return null;
+      const rect = canvas.getBoundingClientRect();
+      const frac = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+      return { x: frac * rect.width, sec: frac * durationSec };
+    },
+    [durationSec],
+  );
+
   const seekFromEvent = useCallback(
     (clientX: number) => {
       const canvas = canvasRef.current;
@@ -118,13 +132,24 @@ export default function Waveform({
           seekFromEvent(e.clientX);
         }}
         onPointerMove={(e) => {
+          const p = posFromClientX(e.clientX);
+          if (p) setHover(p);
           if (draggingRef.current) seekFromEvent(e.clientX);
         }}
+        onPointerLeave={() => setHover(null)}
         onPointerUp={(e) => {
           draggingRef.current = false;
           e.currentTarget.releasePointerCapture(e.pointerId);
         }}
       />
+      {hover && (
+        <div
+          className="pointer-events-none absolute -top-6 -translate-x-1/2 rounded border border-ink-700 bg-ink-950/90 px-1.5 py-0.5 text-[10px] text-mist-300 tabular-nums whitespace-nowrap"
+          style={{ left: hover.x }}
+        >
+          {formatMsTime(hover.sec * 1000)}
+        </div>
+      )}
     </div>
   );
 }

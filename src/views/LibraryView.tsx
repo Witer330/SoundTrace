@@ -1,11 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelTranscribe,
   errMsg,
   importPaths,
-  isTauri,
   transcribeRecording,
   type JobRow,
 } from "../api";
@@ -14,10 +12,12 @@ import {
   formatBytes,
   formatDateTime,
   formatDuration,
-  type ImportResult,
+  parseSummaryHeadline,
   type Recording,
 } from "../types";
 import StatusBadge from "../components/StatusBadge";
+import DropMask from "../components/DropMask";
+import { useAudioDrop } from "../hooks/useAudioDrop";
 
 /** 该录音是否有排队中/进行中的任务 */
 function isActive(r: Recording, jobs: JobRow[]): boolean {
@@ -32,14 +32,18 @@ function RecordingRow({
   selected,
   onToggle,
   onOpen,
+  onTag,
 }: {
   rec: Recording;
   job?: JobRow;
   selected: boolean;
   onToggle: () => void;
   onOpen: () => void;
+  /** 点击行内标签 → 加入筛选（按事件找录音的主入口） */
+  onTag: (tag: string) => void;
 }) {
   const progress = job?.status === "running" ? job.progress : null;
+  const headline = parseSummaryHeadline(rec.summaryMd);
   return (
     <div
       className={`group flex items-center gap-3 px-3 py-2.5 rounded-xl border transition-colors cursor-pointer ${
@@ -64,6 +68,14 @@ function RecordingRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-sm text-mist-200 truncate">{rec.title}</span>
+          {headline?.kind && (
+            <span
+              className="px-1.5 py-0.5 rounded bg-ink-800 text-[10px] text-cyan-accent shrink-0"
+              title="由 AI 纪要识别的录音类型"
+            >
+              {headline.kind}
+            </span>
+          )}
           <StatusBadge status={rec.status} />
           {rec.summaryMd && <span className="text-[11px] text-st-ok shrink-0">有纪要</span>}
         </div>
@@ -73,6 +85,12 @@ function RecordingRow({
           <span>{formatBytes(rec.sizeBytes)}</span>
           <span className="uppercase">{rec.format}</span>
           {rec.participants && <span className="truncate max-w-[140px]">{rec.participants}</span>}
+          {/* 标题已被主题替换时，原始文件名降级为溯源信息 */}
+          {rec.origName !== rec.title && (
+            <span className="truncate max-w-[180px]" title={`原始文件：${rec.origName}`}>
+              {rec.origName}
+            </span>
+          )}
         </div>
         {progress !== null && (
           <div className="mt-1.5 flex items-center gap-2">
@@ -91,9 +109,17 @@ function RecordingRow({
 
       <div className="flex gap-1.5 shrink-0 max-w-[220px]">
         {rec.tags.slice(0, 4).map((t) => (
-          <span key={t} className="px-2 py-0.5 rounded-full bg-ink-800 text-ink-500 text-[11px]">
+          <button
+            key={t}
+            className="px-2 py-0.5 rounded-full bg-ink-800 text-ink-500 text-[11px] hover:text-cyan-accent transition-colors"
+            title={`按标签「${t}」筛选`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onTag(t);
+            }}
+          >
             {t}
-          </span>
+          </button>
         ))}
       </div>
     </div>
@@ -107,15 +133,16 @@ export default function LibraryView() {
   const go = useAppStore((s) => s.go);
   const refreshAll = useAppStore((s) => s.refreshAll);
 
-  const [dragging, setDragging] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [lastResult, setLastResult] = useState<ImportResult | null>(null);
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "pending" | "done" | "failed">("all");
+  // 标签筛选（可叠加，命中任一即显示）：按事件/主题找录音的主入口
+  const [tagFilter, setTagFilter] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchMsg, setBatchMsg] = useState("");
-  const dragDepth = useRef(0);
+  const lastResult = useAppStore((s) => s.lastImport);
+  const setLastResult = useAppStore((s) => s.setLastImport);
 
   async function doImport(paths: string[] | null) {
     if (!paths || paths.length === 0) return;
@@ -132,45 +159,54 @@ export default function LibraryView() {
   }
 
   async function pickFiles() {
-    const paths = await open({
-      multiple: true,
-      filters: [
-        {
-          name: "音频",
-          extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"],
-        },
-      ],
-    });
+    let paths: string[] | string | null = null;
+    try {
+      paths = await open({
+        multiple: true,
+        filters: [
+          {
+            name: "音频",
+            extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"],
+          },
+        ],
+      });
+    } catch {
+      return;
+    }
     await doImport(Array.isArray(paths) ? paths : paths ? [paths] : null);
   }
 
   async function pickFolder() {
-    const dir = await open({ directory: true, multiple: false });
+    let dir: string | null = null;
+    try {
+      dir = await open({ directory: true, multiple: false });
+    } catch {
+      return;
+    }
     await doImport(dir ? [dir] : null);
   }
 
-  useEffect(() => {
-    if (!isTauri()) return;
-    const webview = getCurrentWebview();
-    const unlisten = webview.onDragDropEvent((event) => {
-      const p = event.payload;
-      if (p.type === "enter") {
-        dragDepth.current += 1;
-        setDragging(true);
-      } else if (p.type === "leave") {
-        dragDepth.current = Math.max(0, dragDepth.current - 1);
-        if (dragDepth.current === 0) setDragging(false);
-      } else if (p.type === "drop") {
-        dragDepth.current = 0;
-        setDragging(false);
-        void doImport(p.paths);
-      }
+  const dragging = useAudioDrop((paths) => void doImport(paths));
+
+  // 全库标签及出现次数（LLM 标签 + 手工标签），按次数降序做筛选 chips
+  const allTags = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const r of recordings) {
+      for (const t of r.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh"),
+    );
+  }, [recordings]);
+
+  function toggleTag(tag: string) {
+    setTagFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      return next;
     });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }
 
   // 筛选后的列表
   const visible = useMemo(() => {
@@ -180,6 +216,7 @@ export default function LibraryView() {
         return false;
       if (statusFilter === "done" && r.status !== "done") return false;
       if (statusFilter === "failed" && r.status !== "failed") return false;
+      if (tagFilter.size > 0 && !r.tags.some((t) => tagFilter.has(t))) return false;
       if (!q) return true;
       return (
         r.title.toLowerCase().includes(q) ||
@@ -188,10 +225,20 @@ export default function LibraryView() {
         r.notes.toLowerCase().includes(q)
       );
     });
-  }, [recordings, filter, statusFilter]);
+  }, [recordings, filter, statusFilter, tagFilter]);
 
   const jobOf = (id: number) =>
     jobs.find((j) => j.recordingId === id && (j.status === "pending" || j.status === "running"));
+
+  // 选择集跟随筛选修剪：被筛掉/已删除的行自动移出选择，
+  // 否则批量条的「已选 N 条」会把看不见的录音也算进去
+  useEffect(() => {
+    setSelected((prev) => {
+      const ids = new Set(visible.map((r) => r.id));
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [visible]);
 
   const selectedRecs = visible.filter((r) => selected.has(r.id));
   const selectedTodo = selectedRecs.filter((r) => !isActive(r, jobs));
@@ -296,6 +343,27 @@ export default function LibraryView() {
         </button>
       </div>
 
+      {/* 标签筛选条：点击叠加筛选，再点取消 */}
+      {allTags.length > 0 && (
+        <div className="flex items-center gap-1.5 px-4 py-2 border-b border-ink-800 overflow-x-auto shrink-0">
+          <span className="text-[11px] text-ink-500 shrink-0">标签</span>
+          {allTags.map(([tag, n]) => (
+            <button
+              key={tag}
+              onClick={() => toggleTag(tag)}
+              className={`px-2.5 py-1 rounded-full text-xs whitespace-nowrap border transition-colors ${
+                tagFilter.has(tag)
+                  ? "bg-cyan-accent/15 border-cyan-accent/50 text-cyan-accent"
+                  : "bg-ink-850 border-ink-800 text-ink-500 hover:text-mist-300 hover:border-ink-600"
+              }`}
+            >
+              #{tag}
+              <span className="ml-1 tabular-nums opacity-70">{n}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* 提示条 */}
       {(lastResult || batchMsg) && (
         <div className="mx-4 mt-3 px-3 py-2 rounded-lg bg-ink-850 border border-ink-700 text-sm flex items-start gap-2 shrink-0">
@@ -341,15 +409,28 @@ export default function LibraryView() {
             全选
           </label>
           <span className="text-xs text-ink-500">
-            共 {visible.length} 条{filter || statusFilter !== "all" ? "（已筛选）" : ""}
+            共 {visible.length} 条
+            {filter || statusFilter !== "all" || tagFilter.size > 0 ? "（已筛选）" : ""}
           </span>
-          {selected.size > 0 && (
-            <button
-              className="text-xs text-mist-400 hover:text-mist-200"
-              onClick={() => setSelected(new Set())}
-            >
-              取消选择
-            </button>
+          {(selected.size > 0 || tagFilter.size > 0) && (
+            <>
+              {selected.size > 0 && (
+                <button
+                  className="text-xs text-mist-400 hover:text-mist-200"
+                  onClick={() => setSelected(new Set())}
+                >
+                  取消选择
+                </button>
+              )}
+              {tagFilter.size > 0 && (
+                <button
+                  className="text-xs text-mist-400 hover:text-mist-200"
+                  onClick={() => setTagFilter(new Set())}
+                >
+                  清除标签筛选
+                </button>
+              )}
+            </>
           )}
         </div>
       )}
@@ -400,7 +481,8 @@ export default function LibraryView() {
               job={jobOf(r.id)}
               selected={selected.has(r.id)}
               onToggle={() => toggle(r.id)}
-              onOpen={() => go({ kind: "detail", id: r.id })}
+              onOpen={() => go({ kind: "detail", id: r.id, from: "library" })}
+              onTag={toggleTag}
             />
           ))
         )}
@@ -439,14 +521,7 @@ export default function LibraryView() {
       )}
 
       {/* 拖拽遮罩 */}
-      {dragging && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-ink-950/60 backdrop-blur-sm">
-          <div className="border-2 border-dashed border-cyan-accent/50 rounded-2xl px-16 py-12 text-center">
-            <div className="text-cyan-accent text-lg">松手导入录音</div>
-            <div className="text-mist-400 text-sm mt-1">支持文件或文件夹（递归扫描）</div>
-          </div>
-        </div>
-      )}
+      {dragging && <DropMask />}
     </div>
   );
 }

@@ -2,6 +2,10 @@ export interface AppInfo {
   version: string;
   dataRoot: string;
   defaultDataRoot: string;
+  /** 逻辑核心数（含超线程） */
+  logicalCores: number;
+  /** 「自动」档实际使用的线程数（物理核心数，至少留 2 个逻辑核心） */
+  autoThreads: number;
 }
 
 export type RecordingStatus =
@@ -75,11 +79,13 @@ export interface RecordingPatch {
   tags?: string[];
 }
 
+export type ListViewKind = "workbench" | "library" | "search";
+
 export type View =
   | { kind: "workbench" }
   | { kind: "library" }
   | { kind: "search" }
-  | { kind: "detail"; id: number; seekMs?: number }
+  | { kind: "detail"; id: number; seekMs?: number; from?: ListViewKind }
   | { kind: "settings" };
 
 export function formatDuration(sec: number): string {
@@ -139,3 +145,26 @@ export const STATUS_LABEL: Record<RecordingStatus, string> = {
   done: "已转写",
   failed: "转写失败",
 };
+
+/** 纪要首行「> 类型 · 主题」的解析结果；kind 为空串表示缺分隔符 */
+export interface SummaryHeadline {
+  kind: string;
+  topic: string;
+}
+
+/** 解析纪要首行「> 类型 · 主题」，供列表类型徽章使用（与后端 parse_headline 同规则）：
+ *  首个非空行必须是引用块，分隔符宽容 ·/・/•，缺分隔符时整行当主题 */
+export function parseSummaryHeadline(md: string | null): SummaryHeadline | null {
+  if (!md) return null;
+  const line = md.split("\n").map((l) => l.trim()).find((l) => l !== "");
+  if (!line || !line.startsWith(">")) return null;
+  const body = line.slice(1).trim();
+  if (!body) return null;
+  const strip = (s: string) =>
+    s.replace(/^[*_\s]+/, "").replace(/[*_\s]+$/, "").trim();
+  const sep = body.search(/·|・|•/);
+  if (sep < 0) return { kind: "", topic: strip(body) };
+  const kind = strip(body.slice(0, sep));
+  const topic = strip(body.slice(sep + 1));
+  return topic ? { kind, topic } : null;
+}

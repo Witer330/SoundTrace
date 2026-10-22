@@ -80,6 +80,47 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         )?;
         conn.pragma_update(None, "user_version", 4)?;
     }
+    if version < 5 {
+        // 说话人标注的独立手工标记：自动分离只回填 speaker_edited=0 的段，
+        // 用户手工标/改/清过的段不被静默覆盖（章程：手工修改不可静默丢失）
+        conn.execute_batch(
+            "ALTER TABLE segments ADD COLUMN speaker_edited INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        conn.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        // 主题展示（V6）：纪要首行「> 类型 · 主题」回填为标题。title_edited 标记
+        // 手工命名过的录音，自动回填只碰 title_edited=0 的行——与 speaker_edited 同一模式
+        conn.execute_batch(
+            "ALTER TABLE recordings ADD COLUMN title_edited INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        backfill_titles_from_summary(conn)?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
+    Ok(())
+}
+
+/// V6 存量回填：已有纪要、标题仍为导入默认值的录音，从纪要首行提取主题作标题。
+/// 纯解析 summary_md，不调 LLM；首行不是引用块（旧格式纪要）就保持原状。
+fn backfill_titles_from_summary(conn: &Connection) -> AppResult<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, summary_md FROM recordings
+             WHERE title_edited = 0 AND summary_md IS NOT NULL",
+        )?;
+        let collected = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    for (id, summary) in rows {
+        if let Some((_, topic)) = crate::llm::parse_headline(&summary) {
+            conn.execute(
+                "UPDATE recordings SET title = ?1 WHERE id = ?2 AND title <> ?1",
+                rusqlite::params![topic, id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -141,7 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_rec ON bookmarks(recording_id, time_ms)
 CREATE TABLE IF NOT EXISTS jobs(
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   recording_id INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL,             -- transcribe|summarize|peaks
+  kind         TEXT NOT NULL,             -- transcribe|summarize|peaks|diarize
   status       TEXT NOT NULL DEFAULT 'pending', -- pending|running|done|failed|canceled
   progress     REAL NOT NULL DEFAULT 0,
   error        TEXT,

@@ -1,5 +1,7 @@
 pub mod audio;
+pub mod cpu;
 pub mod db;
+pub mod diar;
 pub mod error;
 pub mod export;
 pub mod job_runner;
@@ -7,6 +9,7 @@ pub mod library;
 pub mod llm;
 pub mod models;
 pub mod paths;
+pub mod priority;
 pub mod search;
 pub mod transcribe;
 
@@ -24,13 +27,27 @@ pub struct AppState {
     pub cancel_flag: Arc<AtomicBool>,
     /// 正在跑转写的子进程（录音 id, pid）；取消时要杀掉它才能立即停止
     pub running_child: Arc<std::sync::Mutex<Option<(i64, u32)>>>,
+    /// 正在跑说话人分离的子进程（录音 id, pid, 最近进度）。与转写分开记录，两个引擎可以并行；
+    /// 分离全局同时只允许一个（整段推理，并行只会互相抢核）。
+    /// 进度记在槽里而不是页面状态里：切走页面再回来，状态依然可查。
+    pub running_diarize: Arc<std::sync::Mutex<Option<(i64, u32, f64)>>>,
+    /// 分离的取消标记：cancel_diarize 置位并杀子进程，工作线程据此回报 canceled
+    pub diarize_cancel: Arc<AtomicBool>,
 }
 
+/// 前端契约见 `src/types.ts` 的 `AppInfo`：字段必须 camelCase，
+/// 否则前端读到的是 undefined（存储卡片会一直显示「…」）。
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppInfo {
     version: String,
     data_root: String,
     default_data_root: String,
+    /// 逻辑核心数：设置页「转写性能」用它换算并展示实际线程数
+    logical_cores: usize,
+    /// 「自动」档实际会用的线程数（物理核心数，至少留 2 个逻辑核心）。
+    /// 由后端算好，避免前端另写一套换算逻辑而与识别器实际取值走偏。
+    auto_threads: usize,
 }
 
 #[tauri::command]
@@ -39,6 +56,8 @@ fn get_app_info(state: State<AppState>) -> AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_root: state.data_root.to_string_lossy().to_string(),
         default_data_root: paths::default_root().to_string_lossy().to_string(),
+        logical_cores: cpu::logical_cores(),
+        auto_threads: cpu::auto_threads(),
     }
 }
 
@@ -65,13 +84,26 @@ fn change_data_root(new_root: String) -> AppResult<()> {
 
 // ---------- 录音库管理（M1） ----------
 
+/// 导入一组文件/录音。
+///
+/// 必须是 async：同步命令在 Tauri 主线程上执行，而导入要做「全量哈希 + ffprobe +
+/// 必要时 ffmpeg 转码 + 复制文件」，几 GB 的目录会让界面整段时间无法重绘（Windows
+/// 直接标记为未响应）。放到阻塞线程池后界面保持可用。
 #[tauri::command]
-fn import_files(state: State<AppState>, paths: Vec<String>) -> AppResult<library::ImportResult> {
-    let importer = Importer {
-        db: &state.db,
-        library_root: paths::library_dir(&state.data_root),
-    };
-    importer.import(&paths)
+async fn import_files(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> AppResult<library::ImportResult> {
+    let db = state.db.clone();
+    let library_root = paths::library_dir(&state.data_root);
+    tauri::async_runtime::spawn_blocking(move || {
+        let importer = Importer {
+            db: &db,
+            library_root,
+        };
+        importer.import(&paths)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -114,10 +146,11 @@ fn delete_recording(state: State<AppState>, id: i64, delete_file: bool) -> AppRe
     importer.delete_recording(id, delete_file)
 }
 
-/// 展开文件/目录路径为音频文件列表（供前端拖拽或选择文件夹后调用）
+/// 展开文件/目录路径为音频文件列表（供前端拖拽或选择文件夹后调用）。
+/// 递归扫描可能很慢（大目录树），同样放阻塞线程池，避免冻住界面。
 #[tauri::command]
-fn expand_audio_paths(paths: Vec<String>) -> AppResult<Vec<String>> {
-    library::expand_audio_paths(&paths)
+async fn expand_audio_paths(paths: Vec<String>) -> AppResult<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || library::expand_audio_paths(&paths)).await?
 }
 
 // ---------- 播放器（M2） ----------
@@ -263,13 +296,15 @@ struct Segment {
     speaker: Option<i64>,
     /// 是否被手工改过（重新转写会覆盖分段，用它提示用户）
     edited: bool,
+    /// 说话人是否被手工标/改/清过：自动分离只回填 speaker_edited=0 的段
+    speaker_edited: bool,
 }
 
 #[tauri::command]
 fn list_segments(state: State<AppState>, recording_id: i64) -> AppResult<Vec<Segment>> {
     let conn = state.db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, recording_id, start_ms, end_ms, text, chars, speaker, edited
+        "SELECT id, recording_id, start_ms, end_ms, text, chars, speaker, edited, speaker_edited
          FROM segments WHERE recording_id = ?1 ORDER BY start_ms",
     )?;
     let rows = stmt
@@ -283,6 +318,7 @@ fn list_segments(state: State<AppState>, recording_id: i64) -> AppResult<Vec<Seg
                 chars: r.get(5)?,
                 speaker: r.get(6)?,
                 edited: r.get::<_, i64>(7)? != 0,
+                speaker_edited: r.get::<_, i64>(8)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -408,12 +444,13 @@ fn merge_segments(state: State<AppState>, ids: Vec<i64>) -> AppResult<i64> {
     merge_segments_impl(&state.db, &ids)
 }
 
-/// 标注某分段的说话人（1 起编号；传 null 清除）
+/// 标注某分段的说话人（1 起编号；传 null 清除）。
+/// speaker_edited 一并打标：用户标过的段不被之后的自动分离静默覆盖。
 #[tauri::command]
 fn set_segment_speaker(state: State<AppState>, id: i64, speaker: Option<i64>) -> AppResult<()> {
     let conn = state.db.conn.lock().unwrap();
     conn.execute(
-        "UPDATE segments SET speaker=?1, edited=1 WHERE id=?2",
+        "UPDATE segments SET speaker=?1, speaker_edited=1, edited=1 WHERE id=?2",
         rusqlite::params![speaker, id],
     )?;
     Ok(())
@@ -444,6 +481,448 @@ fn set_speaker_names(
         serde_json::to_string(&names).unwrap_or_else(|_| "{}".into()),
     );
     state.db.set_settings(&m)
+}
+
+// ---------- 说话人自动分离（V2） ----------
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiarEvent {
+    pub recording_id: i64,
+    /// running | done | failed | canceled
+    pub status: String,
+    pub progress: f64,
+    pub error: String,
+    /// 成功时的互异说话人数（done 才有意义）
+    pub num_speakers: usize,
+}
+
+/// 把分离结果映射回转写分段并落库（可测试）。
+/// 只回填 `speaker_edited=0` 的段：手工标/改/清过的说话人不被静默覆盖；
+/// 上一轮的自动标注先整体清掉，避免残留旧簇编号。
+/// 返回本次成功标注的分段数。
+pub fn finalize_diarize(
+    db: &db::Db,
+    recording_id: i64,
+    segs: &[diar::DiarSeg],
+) -> AppResult<usize> {
+    let conn = db.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, start_ms, end_ms FROM segments WHERE recording_id = ?1 ORDER BY start_ms",
+    )?;
+    let rows = stmt
+        .query_map([recording_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let spans: Vec<(i64, i64)> = rows.iter().map(|(_, s, e)| (*s, *e)).collect();
+    let assign = diar::map_speakers(segs, &spans, diar::MAP_MIN_SHARE);
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE segments SET speaker = NULL WHERE recording_id = ?1 AND speaker_edited = 0",
+        [recording_id],
+    )?;
+    let mut applied = 0;
+    for ((id, _, _), spk) in rows.iter().zip(&assign) {
+        if let Some(s) = spk {
+            // 影响行数：手工保护段（speaker_edited=1）不会被更新，不计入
+            applied += tx.execute(
+                "UPDATE segments SET speaker = ?1 WHERE id = ?2 AND speaker_edited = 0",
+                rusqlite::params![s, id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(applied)
+}
+
+/// 分离运行状态：全局同时最多一个，None 表示空闲。
+/// 页面挂载时查询它来恢复「进行中」显示——进度在后端槽里，不依赖页面存活。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiarizeRunState {
+    recording_id: Option<i64>,
+    progress: f64,
+}
+
+#[tauri::command]
+fn diarize_status(state: State<AppState>) -> DiarizeRunState {
+    match *state.running_diarize.lock().unwrap() {
+        Some((rec, _, progress)) => DiarizeRunState { recording_id: Some(rec), progress },
+        None => DiarizeRunState { recording_id: None, progress: 0.0 },
+    }
+}
+
+/// 对一条录音跑说话人自动分离：起独立子进程（崩溃隔离），完成后映射回转写分段。
+/// 人数必填（锁人数是产品路径，自动阈值实测不可用，见 diar 模块顶部说明）。
+/// 任务进 jobs 表（kind='diarize'）由常驻分离线程串行执行；转写收尾会按
+/// 预设人数自动入队同样的任务（见 finalize_job）。
+#[tauri::command]
+fn run_diarize(state: State<AppState>, recording_id: i64, num_clusters: i64) -> AppResult<()> {
+    if !(1..=32).contains(&num_clusters) {
+        return Err(error::err("说话人数必须是 1~32"));
+    }
+    if !models::ModelLayout::new(paths::models_dir(&state.data_root)).speaker_ready() {
+        return Err(error::err("说话人模型未就绪，请先在设置中下载模型"));
+    }
+    // 记住人数选择，下次打开这条录音时沿用
+    let _ = state.db.set_settings(&HashMap::from([(
+        diar::clusters_setting_key(recording_id),
+        num_clusters.to_string(),
+    )]));
+    enqueue_diarize(&state.db, recording_id)
+}
+
+/// 校验并把分离任务写入队列（命令入口与转写收尾的自动接续共用）。
+pub fn enqueue_diarize(db: &db::Db, recording_id: i64) -> AppResult<()> {
+    let conn = db.conn.lock().unwrap();
+    let seg_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM segments WHERE recording_id = ?1",
+        [recording_id],
+        |r| r.get(0),
+    )?;
+    if seg_count == 0 {
+        return Err(error::err("该录音还没有转写稿，请先完成转写"));
+    }
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs
+         WHERE recording_id = ?1 AND kind='diarize' AND status IN ('pending','running')",
+        [recording_id],
+        |r| r.get(0),
+    )?;
+    if active > 0 {
+        return Err(error::err("该录音已有分离任务在排队或进行"));
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    conn.execute(
+        "INSERT INTO jobs(recording_id, kind, status, created_at, updated_at)
+         VALUES(?1,'diarize','pending',?2,?2)",
+        rusqlite::params![recording_id, now],
+    )?;
+    Ok(())
+}
+
+/// 常驻分离任务线程：轮询 kind='diarize' 的 pending 任务，串行执行。
+/// 与转写 worker 同构——队列落在 jobs 表里，进度可查、可取消、重启后 running → pending 续跑。
+struct DiarizeWorker {
+    db: Arc<db::Db>,
+    data_root: PathBuf,
+    app: tauri::AppHandle,
+    running: Arc<std::sync::Mutex<Option<(i64, u32, f64)>>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl DiarizeWorker {
+    fn spawn(worker: Self) {
+        std::thread::spawn(move || worker.run_loop());
+    }
+
+    fn run_loop(self) {
+        loop {
+            match self.pick_job() {
+                Some((job_id, recording_id)) => self.run_job(job_id, recording_id),
+                None => std::thread::sleep(std::time::Duration::from_millis(700)),
+            }
+        }
+    }
+
+    /// 取最早的 pending 分离任务并置为 running
+    fn pick_job(&self) -> Option<(i64, i64)> {
+        let conn = self.db.conn.lock().unwrap();
+        let job: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT id, recording_id FROM jobs
+                 WHERE kind='diarize' AND status='pending' ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .ok()
+            .flatten();
+        let (job_id, rec_id) = job?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let _ = conn.execute(
+            "UPDATE jobs SET status='running', updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, job_id],
+        );
+        Some((job_id, rec_id))
+    }
+
+    fn run_job(&self, job_id: i64, recording_id: i64) {
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 人数取这条录音记住的预设；没有或非法 → 任务失败并写明原因
+        let num_clusters = self
+            .db
+            .get_setting(&diar::clusters_setting_key(recording_id))
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| (1..=32).contains(n));
+        let Some(num_clusters) = num_clusters else {
+            self.finish(
+                job_id,
+                recording_id,
+                Err(error::err("该录音没有预设有效的分离人数")),
+                false,
+            );
+            return;
+        };
+        let result = diarize_job(
+            &self.app,
+            &self.db,
+            &self.data_root,
+            &self.running,
+            &self.cancel,
+            recording_id,
+            num_clusters,
+        );
+        let canceled = self.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        self.finish(job_id, recording_id, result, canceled);
+    }
+
+    /// 收尾：任务状态落库 + 终态事件
+    fn finish(&self, job_id: i64, recording_id: i64, result: AppResult<usize>, canceled: bool) {
+        use tauri::Emitter;
+        let (status, error, n) = match &result {
+            Ok(num_speakers) => ("done".to_string(), String::new(), *num_speakers),
+            Err(e) => {
+                if canceled {
+                    ("canceled".to_string(), String::new(), 0)
+                } else {
+                    ("failed".to_string(), e.msg.clone(), 0)
+                }
+            }
+        };
+        let progress = if status == "done" { 1.0 } else { 0.0 };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        {
+            let conn = self.db.conn.lock().unwrap();
+            let _ = conn.execute(
+                "UPDATE jobs SET status=?1, error=?2, progress=?3, updated_at=?4 WHERE id=?5",
+                rusqlite::params![status, error, progress, now, job_id],
+            );
+        }
+        let _ = self.app.emit(
+            "diar://progress",
+            DiarEvent { recording_id, status, progress, error, num_speakers: n },
+        );
+    }
+}
+
+/// 一次分离任务的完整生命周期：spawn 子进程 → 转发进度 → 等待 → 映射入库。
+/// 返回成功时的说话人数。崩溃被隔离在子进程里，这里只见到非零退出码。
+fn diarize_job(
+    app: &tauri::AppHandle,
+    db: &Arc<db::Db>,
+    data_root: &std::path::Path,
+    running: &Arc<std::sync::Mutex<Option<(i64, u32, f64)>>>,
+    _cancel: &Arc<AtomicBool>,
+    recording_id: i64,
+    num_clusters: i64,
+) -> AppResult<usize> {
+    use tauri::Emitter;
+    let emit = |status: &str, progress: f64, error: &str, n: usize| {
+        let _ = app.emit(
+            "diar://progress",
+            DiarEvent {
+                recording_id,
+                status: status.into(),
+                progress,
+                error: error.into(),
+                num_speakers: n,
+            },
+        );
+    };
+    emit("running", 0.05, "", 0);
+
+    let cache = paths::cache_dir(data_root);
+    std::fs::create_dir_all(&cache)?;
+    let out_json = cache.join(format!("diar-{recording_id}.json"));
+    let _ = std::fs::remove_file(&out_json);
+
+    let exe = job_runner::child_exe_path("st-diarize")?;
+    let mut cmd = std::process::Command::new(&exe);
+    crate::priority::background(&mut cmd);
+    let mut child = cmd
+        .arg(recording_id.to_string())
+        .arg({
+            let conn = db.conn.lock().unwrap();
+            let p: String = conn
+                .query_row("SELECT file_path FROM recordings WHERE id=?1", [recording_id], |r| r.get(0))
+                .map_err(|_| error::err("录音不存在"))?;
+            p
+        })
+        .arg(paths::models_dir(data_root))
+        .arg(&cache)
+        .arg(&out_json)
+        .arg(num_clusters.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| error::err(format!("启动分离子进程失败：{e}（预期位置 {}）", exe.display())))?;
+    *running.lock().unwrap() = Some((recording_id, child.id(), 0.1));
+
+    // 进度行独立线程读取；父线程阻塞在 wait 上（取消靠外部杀进程）。
+    // 进度同时写回运行槽：页面切走再挂载时，diarize_status 查到的就是最新值
+    let stdout = child.stdout.take();
+    let app2 = app.clone();
+    let running2 = running.clone();
+    let reader = std::thread::spawn(move || {
+        let Some(out) = stdout else { return };
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            match serde_json::from_str::<job_runner::ProgressLine>(line.trim()) {
+                Ok(job_runner::ProgressLine::Progress { value }) => {
+                    if let Some((_, _, p)) = running2.lock().unwrap().as_mut() {
+                        *p = value;
+                    }
+                    use tauri::Emitter;
+                    let _ = app2.emit(
+                        "diar://progress",
+                        DiarEvent {
+                            recording_id,
+                            status: "running".into(),
+                            progress: value,
+                            error: String::new(),
+                            num_speakers: 0,
+                        },
+                    );
+                }
+                Ok(job_runner::ProgressLine::Error { msg }) => eprintln!("[分离] {msg}"),
+                Err(_) => {}
+            }
+        }
+    });
+
+    let status = child.wait()?;
+    *running.lock().unwrap() = None;
+    let _ = reader.join();
+    let stderr_tail = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf.chars().take(400).collect::<String>()
+        })
+        .unwrap_or_default();
+
+    // 先读结果文件：失败时子进程也会写下可读原因
+    let payload = std::fs::read_to_string(&out_json).ok();
+    let _ = std::fs::remove_file(&out_json);
+    if let Some(raw) = payload {
+        if let Ok(out) = serde_json::from_str::<diar::DiarOut>(&raw) {
+            match out {
+                diar::DiarOut::Ok(result) => {
+                    let applied = finalize_diarize(db, recording_id, &result.segments)?;
+                    let _ = applied;
+                    return Ok(result.num_speakers);
+                }
+                diar::DiarOut::Failure { error } => return Err(error::err(error)),
+            }
+        }
+    }
+    Err(error::err(job_runner::explain_child_exit(status.code(), &stderr_tail)))
+}
+
+/// 取消分离：排队中的直接置 canceled；正在跑的杀子进程，分离线程醒来后收尾为 canceled
+#[tauri::command]
+fn cancel_diarize(app: tauri::AppHandle, state: State<AppState>, recording_id: i64) -> AppResult<()> {
+    state
+        .diarize_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some((running_rec, pid, _)) = *state.running_diarize.lock().unwrap() {
+        if running_rec == recording_id {
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let affected = {
+        let conn = state.db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='canceled', updated_at=?1
+             WHERE recording_id=?2 AND kind='diarize' AND status IN ('pending','running')",
+            rusqlite::params![now, recording_id],
+        )?
+    };
+    if affected > 0 {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "diar://progress",
+            DiarEvent {
+                recording_id,
+                status: "canceled".into(),
+                progress: 0.0,
+                error: String::new(),
+                num_speakers: 0,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// 合并说话人：把 `from` 簇的所有段并入 `to` 簇（用户修正过拆错的人）。
+/// 移动的段标记 speaker_edited=1：这是手工修正，之后的自动分离不覆盖。
+#[tauri::command]
+fn merge_speakers(state: State<AppState>, recording_id: i64, from: i64, to: i64) -> AppResult<usize> {
+    if from == to {
+        return Err(error::err("不能把说话人并进它自己"));
+    }
+    let conn = state.db.conn.lock().unwrap();
+    let n = conn.execute(
+        "UPDATE segments SET speaker=?1, speaker_edited=1, edited=1
+         WHERE recording_id=?2 AND speaker=?3",
+        rusqlite::params![to, recording_id, from],
+    )?;
+    if n == 0 {
+        return Err(error::err("「说话人 {from}」没有已标注的分段"));
+    }
+    // 显示名跟着合并：保留 to 的名字，丢掉 from 的
+    let key = format!("speakers.{recording_id}");
+    if let Ok(Some(json)) = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [&key],
+            |r| r.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })
+    {
+        if let Ok(mut names) = serde_json::from_str::<HashMap<String, String>>(&json) {
+            if names.remove(&from.to_string()).is_some() {
+                let mut m = HashMap::new();
+                m.insert(key.clone(), serde_json::to_string(&names).unwrap_or_else(|_| "{}".into()));
+                drop(conn);
+                state.db.set_settings(&m)?;
+                return Ok(n);
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// 从时间中点把一段拆成两段（前端「拆」按钮）。
@@ -720,8 +1199,12 @@ fn get_job(state: State<AppState>, recording_id: i64) -> AppResult<Option<JobInf
 
 // ---------- 检索 / AI 复盘 / 导出（M4） ----------
 
+// async 命令跑在异步线程池上：检索逻辑万一 panic 也不会炸掉主线程
 #[tauri::command]
-fn search_all(state: State<AppState>, query: String) -> AppResult<search::SearchResults> {
+async fn search_all(
+    state: State<'_, AppState>,
+    query: String,
+) -> AppResult<search::SearchResults> {
     search::search(&state.db, &query)
 }
 
@@ -732,17 +1215,25 @@ fn generate_summary(app: tauri::AppHandle, state: State<AppState>, recording_id:
 }
 
 #[tauri::command]
-fn test_llm(state: State<AppState>) -> AppResult<String> {
-    let conn = state.db.conn.lock().unwrap();
-    let get = |key: &str| -> String {
-        conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap_or_default()
+async fn test_llm(state: State<'_, AppState>) -> AppResult<String> {
+    let (base_url, api_key, model, thinking_setting) = {
+        let conn = state.db.conn.lock().unwrap();
+        let get = |key: &str| -> String {
+            conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap_or_default()
+        };
+        (
+            get("llm.baseUrl"),
+            get("llm.apiKey"),
+            get("llm.model"),
+            get("llm.thinking"),
+        )
     };
-    let (base_url, api_key, model) = (get("llm.baseUrl"), get("llm.apiKey"), get("llm.model"));
-    drop(conn);
-    llm::test_llm(&base_url, &api_key, &model)
+    let thinking = llm::thinking_param(&thinking_setting);
+    // 阻塞式 HTTP（超时 600 秒），放阻塞线程池，别冻住界面
+    tauri::async_runtime::spawn_blocking(move || llm::test_llm(&base_url, &api_key, &model, thinking)).await?
 }
 
 #[tauri::command]
@@ -756,8 +1247,11 @@ pub fn run() {
     paths::ensure_dirs(&data_root).expect("初始化数据目录失败");
     let database = std::sync::Arc::new(db::Db::open(&data_root).expect("打开数据库失败"));
     let cancel_flag = Arc::new(AtomicBool::new(false));
+    let diarize_cancel = Arc::new(AtomicBool::new(false));
     // 转写在子进程里跑（原生识别引擎的崩溃不会带走应用），这里记录当前子进程以便取消
     let running_child: Arc<std::sync::Mutex<Option<(i64, u32)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let running_diarize: Arc<std::sync::Mutex<Option<(i64, u32, f64)>>> =
         Arc::new(std::sync::Mutex::new(None));
 
     // 应用上次异常退出遗留的任务：running → pending，录音状态归位
@@ -766,6 +1260,10 @@ pub fn run() {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let _ = conn.execute(
             "UPDATE jobs SET status='pending', updated_at=?1 WHERE kind='transcribe' AND status='running'",
+            [&now],
+        );
+        let _ = conn.execute(
+            "UPDATE jobs SET status='pending', updated_at=?1 WHERE kind='diarize' AND status='running'",
             [&now],
         );
         let _ = conn.execute(
@@ -782,6 +1280,8 @@ pub fn run() {
             data_root: data_root.clone(),
             cancel_flag: cancel_flag.clone(),
             running_child: running_child.clone(),
+            running_diarize: running_diarize.clone(),
+            diarize_cancel: diarize_cancel.clone(),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_info,
@@ -812,6 +1312,10 @@ pub fn run() {
             set_segment_speaker,
             get_speaker_names,
             set_speaker_names,
+            run_diarize,
+            cancel_diarize,
+            diarize_status,
+            merge_speakers,
             count_edited_segments,
             search_all,
             generate_summary,
@@ -833,8 +1337,40 @@ pub fn run() {
                 cancel: state.cancel_flag.clone(),
                 running: state.running_child.clone(),
             });
+            // 启动常驻分离任务线程（队列在 jobs 表：kind='diarize'）
+            DiarizeWorker::spawn(DiarizeWorker {
+                db: state.db.clone(),
+                data_root: state.data_root.clone(),
+                app: app.handle().clone(),
+                running: state.running_diarize.clone(),
+                cancel: state.diarize_cancel.clone(),
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 前端契约：`get_app_info` 的字段必须是 camelCase（见 src/types.ts 的 AppInfo）。
+    /// 缺 `rename_all` 时前端读到的是 undefined——存储卡片曾因此一直显示「…」。
+    #[test]
+    fn app_info_serializes_as_camel_case() {
+        let info = AppInfo {
+            version: "0.2.0".into(),
+            data_root: "C:/x".into(),
+            default_data_root: "C:/y".into(),
+            logical_cores: 16,
+            auto_threads: 14,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["dataRoot"], "C:/x");
+        assert_eq!(v["defaultDataRoot"], "C:/y");
+        assert_eq!(v["logicalCores"], 16);
+        assert_eq!(v["autoThreads"], 14);
+        assert!(v.get("data_root").is_none(), "不应出现 snake_case 字段");
+    }
 }

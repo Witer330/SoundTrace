@@ -1,10 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import Waveform from "./Waveform";
 import { isTauri } from "../api";
 import { formatMsTime } from "../types";
 
-const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 
 /**
  * 把库内文件路径转成可播放的 asset URL。
@@ -51,11 +51,17 @@ export default function PlayerBar({
   onLoadError,
 }: PlayerBarProps) {
   const src = toAssetUrl(filePath);
+  const [volume, setVolume] = useState(1);
 
   useEffect(() => {
     const audio = audioRef.current;
     if (audio) audio.playbackRate = speed;
   }, [speed, audioRef]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (audio) audio.volume = volume;
+  }, [volume, audioRef]);
 
   function toggle() {
     const audio = audioRef.current;
@@ -137,6 +143,18 @@ export default function PlayerBar({
         </div>
 
         <div className="flex-1" />
+
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={volume}
+          onChange={(e) => setVolume(Number(e.target.value))}
+          className="w-20 accent-[var(--color-cyan-accent)] cursor-pointer"
+          title={`音量 ${Math.round(volume * 100)}%`}
+          aria-label="音量"
+        />
 
         <select
           className="h-8 text-xs bg-ink-850 border border-ink-700 rounded-lg px-2 text-mist-300"

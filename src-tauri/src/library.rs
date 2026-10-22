@@ -89,12 +89,48 @@ pub fn expand_audio_paths(paths: &[String]) -> AppResult<Vec<String>> {
     Ok(out)
 }
 
+/// 目录递归扫描的深度上限。重解析点已被跳过（不会成环），这里只是兜底，
+/// 防止异常深的目录树把栈吃光。
+const MAX_SCAN_DEPTH: usize = 64;
+
+/// 是否重解析点（Windows 的 junction / 符号链接）
+fn is_reparse_point(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
 fn collect_audio_files(dir: &Path, out: &mut Vec<String>) -> AppResult<()> {
+    collect_audio_files_at(dir, out, 0)
+}
+
+fn collect_audio_files_at(dir: &Path, out: &mut Vec<String>, depth: usize) -> AppResult<()> {
+    if depth >= MAX_SCAN_DEPTH {
+        return Ok(());
+    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_audio_files(&path, out)?;
+        // 不跟随 junction/符号链接：本机存在自指 junction（AppData\Local\Application Data
+        // 指向 AppData\Local）以及 pnpm node_modules 的链接环，跟随会无限递归，
+        // 让「导入」永远不返回而且一个字节都写不出来。
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            // 权限不足或扫描途中消失的项：跳过它，不要中断整次导入
+            Err(_) => continue,
+        };
+        if is_reparse_point(&meta) {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_audio_files_at(&path, out, depth + 1)?;
         } else if is_audio_file(&path) {
             out.push(path.to_string_lossy().to_string());
         }
@@ -111,9 +147,11 @@ fn hash_file(path: &Path) -> AppResult<String> {
     let f = fs::File::open(path)?;
     let mut reader = BufReader::new(f);
     let mut hasher = Xxh3::new();
-    let mut buf = [0u8; 1 << 20];
+    // 缓冲必须放堆上：主线程栈只有 1 MiB（PE SizeOfStackReserve），栈上 1 MiB 数组会直接
+    // 触发栈溢出（thread 'main' has overflowed its stack），导入一启动就把应用带走。
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(&mut buf[..])?;
         if n == 0 {
             break;
         }
@@ -184,7 +222,10 @@ fn probe_media(path: &Path) -> MediaMeta {
 }
 
 fn run_ffmpeg(args: &[&str]) -> AppResult<()> {
-    let out = Command::new("ffmpeg")
+    let mut cmd = Command::new("ffmpeg");
+    // 导入转码是整文件重编码，别和前台抢 CPU
+    crate::priority::background(&mut cmd);
+    let out = cmd
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(args)
         .output()
@@ -419,10 +460,20 @@ impl<'a> Importer<'a> {
             let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> =
                 vec![Box::new(now_rfc3339())];
             let mut idx = 2;
-            if let Some(v) = patch.title {
-                sets.push(format!("title = ?{idx}"));
-                binds.push(Box::new(v));
-                idx += 1;
+            // 标题值真的变了才算「手工命名」（title_edited=1），锁住后续 AI 主题回填。
+            // 详情页保存会原样带回未改动的标题，不能因此误锁
+            if let Some(v) = &patch.title {
+                let current: String = tx.query_row(
+                    "SELECT title FROM recordings WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                if *v != current {
+                    sets.push(format!("title = ?{idx}"));
+                    binds.push(Box::new(v.clone()));
+                    idx += 1;
+                    sets.push("title_edited = 1".to_string());
+                }
             }
             if let Some(v) = patch.notes {
                 sets.push(format!("notes = ?{idx}"));

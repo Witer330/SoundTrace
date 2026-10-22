@@ -1,16 +1,23 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   countEditedSegments,
+  cancelDiarize,
+  diarizeStatus,
   ensurePeaks,
   errMsg,
   generateSummary,
+  getSettings,
   listBookmarks,
   listSegments,
   modelsStatus,
+  runDiarize,
+  setSettings,
   transcribeRecording,
 } from "../api";
-import type { JobRow } from "../api";
+import type { DiarEvent, JobRow } from "../api";
 import { formatBytes, formatDateTime, formatDuration, formatMsTime, type Recording } from "../types";
+import { useAppStore } from "../store";
 import StatusBadge from "./StatusBadge";
 
 type StageState = "done" | "pending" | "running" | "failed" | "idle";
@@ -40,11 +47,14 @@ function Stage({
   name,
   state,
   lines,
+  extra,
   action,
 }: {
   name: string;
   state: StageState;
   lines: { label: string; value: string; tone?: string }[];
+  /** 阶段内联控件（如人数选择），渲染在产物行与操作按钮之间 */
+  extra?: ReactNode;
   action?: { label: string; onClick: () => void; busy?: boolean; disabled?: boolean; danger?: boolean };
 }) {
   return (
@@ -74,6 +84,7 @@ function Stage({
           </div>
         ))}
       </div>
+      {extra && <div className="mt-1.5 flex items-center gap-1.5">{extra}</div>}
       {action && (
         <button
           className={`mt-1.5 px-2 py-1 rounded text-[11px] transition-colors disabled:opacity-50 ${
@@ -119,8 +130,17 @@ export default function PipelinePanel({
   const [speakerTotal, setSpeakerTotal] = useState(0);
   const [bookmarkCount, setBookmarkCount] = useState(0);
   const [modelsReady, setModelsReady] = useState(true);
-  const [busy, setBusy] = useState<"" | "peaks" | "transcribe" | "summary">("");
+  const [busy, setBusy] = useState<"" | "peaks" | "transcribe">("");
   const [error, setError] = useState("");
+  // 说话人自动分离：人数选择（锁人数是产品路径，自动阈值实测不可用）与运行状态
+  const [diarCount, setDiarCount] = useState(2);
+  const [diarBusy, setDiarBusy] = useState(false);
+  const [diarProgress, setDiarProgress] = useState(0);
+  // 分离模型是否就绪（与转写模型相互独立）
+  const [spkModelsReady, setSpkModelsReady] = useState(true);
+  // 纪要生成是后台线程，状态记在全局 store：切页签/重进详情都不会丢
+  const summarizing = useAppStore((s) => s.summarizingId === rec.id);
+  const setSummarizingId = useAppStore((s) => s.setSummarizingId);
 
   const load = useCallback(() => {
     listSegments(rec.id)
@@ -141,9 +161,87 @@ export default function PipelinePanel({
   useEffect(() => {
     load();
     modelsStatus()
-      .then((ms) => setModelsReady(ms.every((m) => m.ready)))
+      .then((ms) => {
+        setModelsReady(ms.filter((m) => ["paraformer", "vad", "punct"].includes(m.id)).every((m) => m.ready));
+        setSpkModelsReady(
+          ms.filter((m) => ["seg", "campplus"].includes(m.id)).every((m) => m.ready),
+        );
+      })
       .catch(() => undefined);
   }, [load, rec.status]);
+
+  // 分离人数预填：优先用上次的选择，否则按参会人字段估算（有人没发言时允许改）
+  useEffect(() => {
+    getSettings()
+      .then((s) => {
+        const saved = s[`diar.clusters.${rec.id}`];
+        if (saved && Number(saved) >= 1) {
+          setDiarCount(Math.min(8, Number(saved)));
+        } else {
+          const n = rec.participants
+            .split(/[、,，;；/·]+/)
+            .map((t) => t.trim())
+            .filter(Boolean).length;
+          setDiarCount(Math.min(8, Math.max(2, n)));
+        }
+      })
+      .catch(() => undefined);
+  }, [rec.id, rec.participants]);
+
+  // 分离进度事件：running 更新进度，终态刷新流水线
+  useEffect(() => {
+    const un = listen<DiarEvent>("diar://progress", (e) => {
+      const p = e.payload;
+      if (p.recordingId !== rec.id) return;
+      if (p.status === "running") {
+        setDiarBusy(true);
+        setDiarProgress(p.progress);
+      } else {
+        setDiarBusy(false);
+        setDiarProgress(0);
+        if (p.status === "failed") setError(p.error || "分离失败");
+        if (p.status === "done") {
+          load();
+          onChanged();
+        }
+      }
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [rec.id, load, onChanged]);
+
+  // 挂载时向后端核实运行状态：进度记在后端槽里，切走页面再回来不丢「进行中」
+  useEffect(() => {
+    let alive = true;
+    diarizeStatus()
+      .then((s) => {
+        if (!alive) return;
+        if (s.recordingId === rec.id) {
+          setDiarBusy(true);
+          setDiarProgress(s.progress);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [rec.id]);
+
+  // 纪要生成结果（全局收尾在 App：清 store 状态 + 刷新列表；这里负责本页反馈）
+  useEffect(() => {
+    const un = listen<{ recordingId: number; ok: boolean; error: string }>(
+      "summarize://done",
+      (e) => {
+        if (e.payload.recordingId !== rec.id) return;
+        if (e.payload.ok) onChanged();
+        else setError(e.payload.error || "纪要生成失败");
+      },
+    );
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [rec.id, onChanged]);
 
   const runPeaks = () => {
     setBusy("peaks");
@@ -174,11 +272,22 @@ export default function PipelinePanel({
   };
 
   const runSummary = () => {
-    setBusy("summary");
+    if (summarizing) return;
     setError("");
-    generateSummary(rec.id)
-      .catch((e) => setError(errMsg(e)))
-      .finally(() => setBusy(""));
+    setSummarizingId(rec.id);
+    generateSummary(rec.id).catch((e) => {
+      setSummarizingId(null);
+      setError(errMsg(e));
+    });
+  };
+
+  const runDiarizeNow = () => {
+    setError("");
+    runDiarize(rec.id, diarCount).catch((e) => setError(errMsg(e)));
+  };
+
+  const cancelDiarizeNow = () => {
+    cancelDiarize(rec.id).catch((e) => setError(errMsg(e)));
   };
 
   // ---- 各阶段状态 ----
@@ -194,8 +303,13 @@ export default function PipelinePanel({
           ? "failed"
           : "idle";
 
-  const speakerState: StageState = speakerCount > 0 ? "done" : "idle";
-  const summaryState: StageState = rec.summaryMd ? "done" : rec.status === "done" ? "idle" : "pending";
+  const summaryState: StageState = summarizing
+    ? "running"
+    : rec.summaryMd
+      ? "done"
+      : rec.status === "done"
+        ? "idle"
+        : "pending";
 
   return (
     <aside className="w-60 shrink-0 border-r border-ink-800 bg-ink-900/50 overflow-y-auto">
@@ -237,12 +351,12 @@ export default function PipelinePanel({
                     { label: "进度", value: `${Math.round((job?.progress ?? 0) * 100)}%`, tone: "text-st-info" },
                     {
                       label: "剩余",
-                      value: formatDuration(
+                      value: `约 ${formatDuration(
                         Math.max(
                           0,
                           (rec.durationSec * (1 - (job?.progress ?? 0))) / 8,
                         ),
-                      ),
+                      )}（按 8 倍速估算）`,
                       tone: "text-ink-500",
                     },
                   ]
@@ -271,18 +385,66 @@ export default function PipelinePanel({
           />
 
           <Stage
-            name="说话人标注"
-            state={speakerState}
+            name="说话人分离"
+            state={diarBusy ? "running" : speakerCount > 0 ? "done" : "idle"}
             lines={
-              speakerTotal === 0
+              diarBusy
                 ? [
-                    { label: "状态", value: "未标注", tone: "text-ink-500" },
-                    { label: "提示", value: "在转写稿里点「+ 说话人」", tone: "text-ink-500" },
+                    {
+                      label: "进度",
+                      value:
+                        diarProgress > 0.25
+                          ? `${Math.round(diarProgress * 100)}%`
+                          : "整段推理中，无精确进度…",
+                      tone: "text-st-info",
+                    },
                   ]
-                : [
-                    { label: "说话人", value: `${speakerCount} 人` },
-                    { label: "已标注", value: `${speakerTotal} 段` },
-                  ]
+                : rec.status !== "done"
+                  ? [
+                      { label: "预设", value: `${diarCount} 人` },
+                      { label: "说明", value: "转写完成后自动分离", tone: "text-ink-500" },
+                    ]
+                  : speakerTotal === 0
+                    ? [{ label: "状态", value: "未标注", tone: "text-ink-500" }]
+                    : [
+                        { label: "说话人", value: `${speakerCount} 人` },
+                        { label: "已标注", value: `${speakerTotal} 段` },
+                        { label: "保护", value: "手工标注不被覆盖" },
+                      ]
+            }
+            extra={
+              <label className="flex items-center gap-1 text-[11px] text-ink-500">
+                人数
+                <select
+                  className="text-xs py-0.5"
+                  value={diarCount}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    setDiarCount(n);
+                    // 选择即持久化：转写完成前预设的人数，转写收尾会自动接分离
+                    setSettings({ [`diar.clusters.${rec.id}`]: String(n) }).catch(() => undefined);
+                  }}
+                  disabled={diarBusy}
+                  title="分错时改人数重跑；默认按参会人预填；转写完成前设定则转写完自动分离"
+                >
+                  {[2, 3, 4, 5, 6, 7, 8].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            }
+            action={
+              diarBusy
+                ? { label: "取消分离", onClick: cancelDiarizeNow, busy: false }
+                : rec.status === "done"
+                  ? {
+                      label: speakerTotal > 0 ? "重新分离" : "自动分离",
+                      onClick: runDiarizeNow,
+                      disabled: !spkModelsReady,
+                    }
+                  : undefined
             }
           />
 
@@ -290,21 +452,23 @@ export default function PipelinePanel({
             name="AI 纪要"
             state={summaryState}
             lines={
-              rec.summaryMd
-                ? [
-                    { label: "模型", value: rec.llmModel ?? "—" },
-                    { label: "字数", value: `${rec.summaryMd.length} 字` },
-                  ]
-                : rec.status === "done"
-                  ? [{ label: "状态", value: "未生成", tone: "text-ink-500" }]
-                  : [{ label: "前置", value: "需先完成转写", tone: "text-ink-500" }]
+              summarizing
+                ? [{ label: "状态", value: "正在生成（需 1~3 分钟）…", tone: "text-st-info" }]
+                : rec.summaryMd
+                  ? [
+                      { label: "模型", value: rec.llmModel ?? "—" },
+                      { label: "字数", value: `${rec.summaryMd.length} 字` },
+                    ]
+                  : rec.status === "done"
+                    ? [{ label: "状态", value: "未生成", tone: "text-ink-500" }]
+                    : [{ label: "前置", value: "需先完成转写", tone: "text-ink-500" }]
             }
             action={
               rec.status === "done"
                 ? {
                     label: rec.summaryMd ? "重新生成" : "生成纪要",
                     onClick: runSummary,
-                    busy: busy === "summary",
+                    busy: summarizing,
                   }
                 : undefined
             }
@@ -335,6 +499,9 @@ export default function PipelinePanel({
           </div>
           {!modelsReady && (
             <div className="text-st-warn pt-1">转写模型未就绪，请到设置页下载</div>
+          )}
+          {!spkModelsReady && (
+            <div className="text-st-warn pt-1">说话人模型未就绪，请到设置页下载</div>
           )}
           {error && <div className="text-st-err pt-1">{error}</div>}
         </div>

@@ -462,11 +462,16 @@ fn real_recordings_full_pipeline() {
         );
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let t3 = Instant::now();
+        println!(
+            "  参数：线程数 {}（ST_ASR_THREADS 可覆盖，用于扫 RTF 曲线）",
+            soundtrace_lib::transcribe::resolve_threads("auto")
+        );
         let rows = soundtrace_lib::transcribe::run_pipeline(
             Path::new(&rec.file_path),
             &mroot,
             &paths::cache_dir(&root),
             rec.id,
+            "auto",
             &cancel,
             |p| {
                 if (p * 100.0) as i32 % 25 == 0 {

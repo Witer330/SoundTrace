@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * 把转写引擎（子进程）构建到 Tauri 期望的位置。
+ * 把子进程引擎（转写 + 说话人分离）构建到 Tauri 期望的位置。
  *
  * 为什么需要这一层：原生识别引擎在特定音频内容上会破坏栈保护并让进程直接退出，
- * 因此转写被放进独立子进程（src/bin/st-transcribe.rs），由主程序 spawn。
- * Tauri 打包要求外部二进制带目标三元组后缀并放在 src-tauri/binaries/ 下，
+ * 因此转写与说话人分离分别放在独立子进程（src/bin/st-transcribe.rs、st-diarize.rs），
+ * 由主程序 spawn。Tauri 打包要求外部二进制带目标三元组后缀并放在 src-tauri/binaries/ 下，
  * 这个脚本负责构建并放到那个位置，保证 `pnpm tauri build` 打出的安装包里带上引擎。
  *
  * 开发时不需要它：`cargo build` 会把 bin 与主程序放在同一 profile 目录，主程序按同级查找即可。
@@ -33,25 +33,29 @@ if (!hostLine) {
 }
 const triple = hostLine.slice("host: ".length).trim();
 
-const srcName = process.platform === "win32" ? "st-transcribe.exe" : "st-transcribe";
 const isWin = process.platform === "win32";
-const tripleName = `${srcName.replace(/\.exe$/, "")}-${triple}${isWin ? ".exe" : ""}`;
+const bins = ["st-transcribe", "st-diarize"];
 
-console.log(`[sidecar] 构建转写引擎（${triple}）…`);
-run("cargo build --release --bin st-transcribe", srcTauri);
+for (const bin of bins) {
+  const srcName = isWin ? `${bin}.exe` : bin;
+  const tripleName = `${bin}-${triple}${isWin ? ".exe" : ""}`;
 
-const built = join(srcTauri, "target", "release", srcName);
-if (!existsSync(built)) {
-  console.error(`[sidecar] 构建产物不存在：${built}`);
-  process.exit(1);
-}
+  console.log(`[sidecar] 构建 ${bin}（${triple}）…`);
+  run(`cargo build --release --bin ${bin}`, srcTauri);
 
-mkdirSync(binariesDir, { recursive: true });
-// 产物放两份：
-// - 带三元组名：Tauri 的 externalBin 约定 / 便于人工辨认目标平台
-// - 固定名：tauri.conf.json 的 bundle.resources 引用它（路径需跨平台稳定）
-for (const name of [tripleName, srcName]) {
-  const dest = join(binariesDir, name);
-  copyFileSync(built, dest);
-  console.log(`[sidecar] 已就位：${dest}`);
+  const built = join(srcTauri, "target", "release", srcName);
+  if (!existsSync(built)) {
+    console.error(`[sidecar] 构建产物不存在：${built}`);
+    process.exit(1);
+  }
+
+  mkdirSync(binariesDir, { recursive: true });
+  // 产物放两份：
+  // - 带三元组名：Tauri 的 externalBin 约定 / 便于人工辨认目标平台
+  // - 固定名：tauri.conf.json 的 bundle.resources 引用它（路径需跨平台稳定）
+  for (const name of [tripleName, srcName]) {
+    const dest = join(binariesDir, name);
+    copyFileSync(built, dest);
+    console.log(`[sidecar] 已就位：${dest}`);
+  }
 }

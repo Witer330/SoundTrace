@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { errMsg, isTauri, searchAll, type SearchResults } from "../api";
 import { useAppStore } from "../store";
 import { formatDate, formatDuration, formatMsTime } from "../types";
+import Highlight from "../components/Highlight";
 import StatusBadge from "../components/StatusBadge";
 
 /** 全文搜索：标题 / 标签 / 笔记 / 参会人 + 转写全文片段，命中可直达时间点 */
@@ -20,20 +21,18 @@ export default function SearchView() {
     inputRef.current?.focus();
   }, []);
 
-  // 防抖 350ms
+  // 防抖 350ms；搜索中状态在定时器里才置位，避免每敲一个键先闪 350ms 假加载
   useEffect(() => {
-    const q = query.trim();
-    if (!q) {
-      setResults(null);
-      setError("");
-      return;
-    }
-    setSearching(true);
     const timer = setTimeout(() => {
-      if (!isTauri()) {
+      const q = query.trim();
+      if (!q) {
+        setResults(null);
+        setError("");
         setSearching(false);
         return;
       }
+      if (!isTauri()) return;
+      setSearching(true);
       searchAll(q)
         .then((r) => {
           setResults(r);
@@ -106,6 +105,11 @@ export default function SearchView() {
             </div>
           )}
 
+          {/* 已有旧结果、正在拉新结果时给个轻提示，避免看起来像没反应 */}
+          {q && searching && results && (
+            <div className="text-[11px] text-ink-500 px-1">结果更新中…</div>
+          )}
+
           {/* 转写片段命中 */}
           {q && (results?.segments.length ?? 0) > 0 && (
             <div className="space-y-2">
@@ -116,7 +120,12 @@ export default function SearchView() {
                 <button
                   key={i}
                   onClick={() =>
-                    go({ kind: "detail", id: seg.recordingId, seekMs: seg.startMs })
+                    go({
+                      kind: "detail",
+                      id: seg.recordingId,
+                      seekMs: seg.startMs,
+                      from: "search",
+                    })
                   }
                   className="w-full text-left px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors"
                 >
@@ -128,7 +137,9 @@ export default function SearchView() {
                     <span>·</span>
                     <span className="shrink-0">{formatDate(seg.recordedAt)}</span>
                   </div>
-                  <div className="text-sm text-mist-300 mt-1 line-clamp-2">{seg.snippet}</div>
+                  <div className="text-sm text-mist-300 mt-1 line-clamp-2">
+                    <Highlight text={seg.snippet} query={q} />
+                  </div>
                 </button>
               ))}
             </div>
@@ -141,12 +152,14 @@ export default function SearchView() {
               {hitRecordings.map((r) => (
                 <button
                   key={r.id}
-                  onClick={() => go({ kind: "detail", id: r.id })}
+                  onClick={() => go({ kind: "detail", id: r.id, from: "search" })}
                   className="w-full flex items-center gap-4 px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors text-left"
                 >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-mist-200 truncate">{r.title}</span>
+                      <span className="text-sm text-mist-200 truncate">
+                        <Highlight text={r.title} query={q} />
+                      </span>
                       <StatusBadge status={r.status} />
                     </div>
                     <div className="text-xs text-ink-500 mt-1 flex gap-3 flex-wrap">

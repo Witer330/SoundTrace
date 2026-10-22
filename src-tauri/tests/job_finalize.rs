@@ -295,6 +295,151 @@ fn child_process_success_round_trip() {
     println!("首段：{first}");
 }
 
+/// 子进程参数协议：第 6 个参数（`asr_threads`）可选——省略时与旧版父进程兼容，
+/// 给了就透传给识别器；参数个数明显不对则必须以退出码 2 + 用法提示拒绝。
+///
+/// 这里用 1 秒**数字静音**验证边界（不产生语音分段，也就不会走识别器解码），
+/// 完整成功路径由 `child_process_success_round_trip` 覆盖。
+#[test]
+fn child_accepts_optional_thread_arg() {
+    use soundtrace_lib::job_runner::PipelineOutput;
+
+    let test_exe = std::env::current_exe().unwrap();
+    let bin_dir = test_exe.parent().unwrap().parent().unwrap();
+    let child_exe = bin_dir.join(if cfg!(windows) {
+        "st-transcribe.exe"
+    } else {
+        "st-transcribe"
+    });
+    if !child_exe.is_file() {
+        eprintln!("跳过：找不到子进程 {}（先 cargo build）", child_exe.display());
+        return;
+    }
+
+    let root = temp_root("argprotocol");
+    paths::ensure_dirs(&root).unwrap();
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let wav = cache.join("silence.wav");
+    write_silence_wav(&wav, 1);
+    let out_json = cache.join("out.json");
+
+    // 参数个数边界。注意 `std::env::args()` 含 argv[0]（程序名），所以「传 5 个」= 总数 6
+    // = 旧版父进程的调用方式，「传 6 个」= 总数 7 = 带 asr_threads 的新调用。二者都必须放行，
+    // 只有传 4 个与 8 个才该被用法检查挡下。
+    // 这几个用例只验证边界：路径填占位符（模型必然未就绪），因此不会真的跑识别。
+    let base = [
+        "1".to_string(),
+        "占位".to_string(),
+        "占位".to_string(),
+        cache.to_string_lossy().into_owned(),
+        out_json.to_string_lossy().into_owned(),
+        "2".to_string(),
+    ];
+
+    for count in [4usize, 8] {
+        let args = if count == 4 {
+            base[..4].to_vec()
+        } else {
+            let mut v = base.to_vec();
+            v.push("多余".to_string());
+            v.push("多余".to_string());
+            v
+        };
+        let out = std::process::Command::new(&child_exe)
+            .args(&args)
+            .output()
+            .expect("无法启动子进程");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "传 {count} 个参数应退出码 2，实际 {:?}，stderr={stderr}",
+            out.status.code()
+        );
+        assert!(stderr.contains("用法"), "应提示用法，实际：{stderr}");
+    }
+
+    for count in [5usize, 6] {
+        let args = base[..count].to_vec();
+        let out = std::process::Command::new(&child_exe)
+            .args(&args)
+            .output()
+            .expect("无法启动子进程");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "传 {count} 个参数是合法调用，却被当成用法错误：{stderr}"
+        );
+        assert!(
+            !stderr.contains("用法"),
+            "传 {count} 个参数不该提示用法：{stderr}"
+        );
+    }
+
+    let mroot = std::env::var("ST_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap().join("SoundTrace").join("models"));
+    if !soundtrace_lib::models::ModelLayout::new(mroot.clone()).all_ready() {
+        eprintln!("跳过：模型未就绪");
+        return;
+    }
+
+    // 带 asr_threads 的真实调用：必须一路走到流水线并产出协议结果
+    let _ = std::fs::remove_file(&out_json);
+    let out = std::process::Command::new(&child_exe)
+        .arg("1")
+        .arg(&wav)
+        .arg(&mroot)
+        .arg(&cache)
+        .arg(&out_json)
+        .arg("2")
+        .output()
+        .expect("无法启动子进程");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "带 asr_threads 的调用被当成用法错误了：{stderr}"
+    );
+    let raw = std::fs::read_to_string(&out_json).expect("结果文件应存在（失败也要落盘）");
+    match serde_json::from_str::<PipelineOutput>(&raw) {
+        Ok(PipelineOutput::Failure { error }) => {
+            // 静音没有语音内容，预期就是这条失败
+            println!("按预期返回失败：{error}");
+            assert!(
+                error.contains("语音") || error.contains("模型"),
+                "静音应报「未识别到语音内容」，实际：{error}"
+            );
+        }
+        Ok(PipelineOutput::Rows(rows)) => println!("静音竟识别出 {} 段（可接受）", rows.len()),
+        Err(e) => panic!("结果文件不符合协议：{e}，原文 {raw}"),
+    }
+}
+
+/// 生成指定秒数的 16kHz 单声道 PCM WAV（全零 = 数字静音）
+fn write_silence_wav(path: &std::path::Path, seconds: usize) {
+    let sample_rate: u32 = 16000;
+    let data = vec![0u8; sample_rate as usize * seconds * 2];
+    let data_len = data.len() as u32;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // 字节率
+    wav.extend_from_slice(&2u16.to_le_bytes()); // 块对齐
+    wav.extend_from_slice(&16u16.to_le_bytes()); // 位深
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(path, wav).expect("写入测试 WAV 失败");
+}
+
 /// 重新转写成功时应整批替换旧分段，而不是叠加（否则稿子会出现重复内容）
 #[test]
 fn finalize_success_replaces_previous_segments() {
@@ -340,4 +485,62 @@ fn finalize_success_replaces_previous_segments() {
         )
         .unwrap();
     assert_eq!(text, "新的转写结果");
+}
+
+fn diarize_job_count(db: &Db, rec: i64) -> i64 {
+    let conn = db.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE recording_id=?1 AND kind='diarize'",
+        [rec],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// 「转写前预设人数、转写完自动分离」的收尾契约：
+/// 预设了人数 → 转写成功后自动产生 kind='diarize' 的 pending 任务；
+/// 没预设 → 不产生（保持「人工逐条分离」的现状，符合历史录音批量转写的用法）。
+#[test]
+fn finalize_success_enqueues_auto_diarize_only_when_preset() {
+    let rows = vec![SegRow {
+        start_ms: 0,
+        end_ms: 500,
+        text: "x".into(),
+        chars: "[]".into(),
+    }];
+    let info = |rec: i64, job: i64| JobInfo {
+        id: job,
+        recording_id: rec,
+        file_path: "C:/lib/a.m4a".into(),
+    };
+
+    // 无预设：不产生分离任务
+    let root = temp_root("auto-diar-off");
+    paths::ensure_dirs(&root).unwrap();
+    let db = Arc::new(Db::open(&root).unwrap());
+    let (rec, job) = fixture(&db);
+    finalize_job(&db, &info(rec, job), Ok(rows.clone()), false);
+    assert_eq!(diarize_job_count(&db, rec), 0, "未预设不应自动入队");
+
+    // 预设 3 人：成功后产生一条 pending 的分离任务
+    let root = temp_root("auto-diar-on");
+    paths::ensure_dirs(&root).unwrap();
+    let db = Arc::new(Db::open(&root).unwrap());
+    let (rec, job) = fixture(&db);
+    db.set_settings(&std::collections::HashMap::from([(
+        soundtrace_lib::diar::clusters_setting_key(rec),
+        "3".into(),
+    )]))
+    .unwrap();
+    finalize_job(&db, &info(rec, job), Ok(rows), false);
+    assert_eq!(diarize_job_count(&db, rec), 1, "预设人数后转写完成应自动入队");
+    let conn = db.conn.lock().unwrap();
+    let (kind, status): (String, String) = conn
+        .query_row(
+            "SELECT kind, status FROM jobs WHERE recording_id=?1 AND kind='diarize'",
+            [rec],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((kind.as_str(), status.as_str()), ("diarize", "pending"));
 }

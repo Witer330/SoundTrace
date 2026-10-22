@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Recording, View } from "./types";
+import type { ImportResult, Recording, View } from "./types";
 import { isTauri, listJobs, listRecordings, type JobRow } from "./api";
 
 export type ThemeMode = "system" | "light" | "dark";
@@ -32,8 +32,14 @@ interface AppState {
   libraryQuery: string;
   theme: Theme;
   themeMode: ThemeMode;
+  /** 最近一次导入的结果：工作台导入后会跳到录音库，提示条跟着数据走才不会丢 */
+  lastImport: ImportResult | null;
+  /** 正在生成 AI 纪要的录音 id（后台任务没有 job 行，只能前端记账） */
+  summarizingId: number | null;
   go: (view: View) => void;
   setLibraryQuery: (q: string) => void;
+  setLastImport: (r: ImportResult | null) => void;
+  setSummarizingId: (id: number | null) => void;
   refreshRecordings: () => Promise<void>;
   refreshJobs: () => Promise<void>;
   /** 录音列表 + 队列一起刷新（工作台与库列表共用） */
@@ -50,6 +56,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   libraryQuery: "",
   theme: "dark",
   themeMode: "system",
+  lastImport: null,
+  summarizingId: null,
 
   go: (view) => {
     set({ view });
@@ -63,6 +71,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setLibraryQuery: (q) => set({ libraryQuery: q }),
+
+  setLastImport: (r) => set({ lastImport: r }),
+
+  setSummarizingId: (id) => set({ summarizingId: id }),
 
   refreshRecordings: async () => {
     if (!isTauri()) {

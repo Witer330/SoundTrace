@@ -9,7 +9,10 @@ pub const PEAK_RESOLUTION_MS: usize = 100;
 /// 解码音频为 16kHz 单声道 PCM 流，按桶取峰值（0.0~1.0）。
 /// 通过管道流式处理，不落盘、内存占用恒定。
 pub fn compute_peaks(path: &Path) -> AppResult<Vec<f32>> {
-    let mut child = Command::new("ffmpeg")
+    let mut cmd = Command::new("ffmpeg");
+    // 整文件解码，可能持续数秒到数十秒，别和前台抢 CPU
+    crate::priority::background(&mut cmd);
+    let mut child = cmd
         .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .arg("-i").arg(path)
         .args(["-f", "s16le", "-ac", "1", "-ar", "16000", "-"])

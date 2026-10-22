@@ -5,11 +5,14 @@ import {
   errMsg,
   importPaths,
   isTauri,
+  transcribeRecording,
   type JobRow,
 } from "../api";
 import { useAppStore } from "../store";
-import { formatDuration, type ImportResult, type Recording } from "../types";
+import { formatDuration, type Recording } from "../types";
 import StatusBadge from "../components/StatusBadge";
+import DropMask from "../components/DropMask";
+import { useAudioDrop } from "../hooks/useAudioDrop";
 
 /** 累计音频时长的口语化格式：68 小时 20 分 */
 function formatTotalDuration(sec: number): string {
@@ -63,6 +66,7 @@ function JobCard({ job, queueIndex }: { job: JobRow; queueIndex: number }) {
   const recordings = useAppStore((s) => s.recordings);
   const refreshAll = useAppStore((s) => s.refreshAll);
   const [busy, setBusy] = useState(false);
+  const [retryErr, setRetryErr] = useState("");
   const rec = job.recordingId ? recordings.find((r) => r.id === job.recordingId) : undefined;
   const active = job.status === "running" || job.status === "pending";
 
@@ -72,7 +76,7 @@ function JobCard({ job, queueIndex }: { job: JobRow; queueIndex: number }) {
       : job.status === "pending"
         ? `队列第 ${queueIndex} 位`
         : job.status === "failed"
-          ? (job.error || "转写失败")
+          ? (retryErr || job.error || "转写失败")
           : formatRelative(job.updatedAt);
 
   return (
@@ -82,7 +86,9 @@ function JobCard({ job, queueIndex }: { job: JobRow; queueIndex: number }) {
 
       <button
         className="flex-1 min-w-0 text-left group"
-        onClick={() => job.recordingId && go({ kind: "detail", id: job.recordingId })}
+        onClick={() =>
+          job.recordingId && go({ kind: "detail", id: job.recordingId, from: "workbench" })
+        }
         disabled={!job.recordingId}
       >
         <div className="text-sm text-mist-200 truncate group-hover:text-cyan-accent">
@@ -105,12 +111,13 @@ function JobCard({ job, queueIndex }: { job: JobRow; queueIndex: number }) {
 
       {active && (
         <button
-          className="shrink-0 px-2 py-1 rounded text-[11px] bg-ink-800 hover:bg-ink-700 text-mist-400 hover:text-mist-200"
-          disabled={busy}
+          className="shrink-0 px-2 py-1 rounded text-[11px] bg-ink-800 hover:bg-ink-700 text-mist-400 hover:text-mist-200 disabled:opacity-50"
+          disabled={busy || !job.recordingId}
           onClick={async () => {
+            if (!job.recordingId) return;
             setBusy(true);
             try {
-              await cancelTranscribe(job.recordingId!);
+              await cancelTranscribe(job.recordingId);
               await refreshAll();
             } catch {
               // 忽略：状态会由事件回推
@@ -120,6 +127,28 @@ function JobCard({ job, queueIndex }: { job: JobRow; queueIndex: number }) {
           }}
         >
           取消
+        </button>
+      )}
+
+      {job.status === "failed" && job.recordingId && (
+        <button
+          className="shrink-0 px-2 py-1 rounded text-[11px] bg-ink-800 hover:bg-ink-700 text-mist-400 hover:text-mist-200 disabled:opacity-50"
+          disabled={busy}
+          title="重新排队转写"
+          onClick={async () => {
+            setRetryErr("");
+            setBusy(true);
+            try {
+              await transcribeRecording(job.recordingId!);
+              await refreshAll();
+            } catch (e) {
+              setRetryErr(errMsg(e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          重试
         </button>
       )}
 
@@ -162,11 +191,12 @@ export default function WorkbenchView() {
   const recordings = useAppStore((s) => s.recordings);
   const loaded = useAppStore((s) => s.recordingsLoaded);
   const jobs = useAppStore((s) => s.jobs);
+  const lastResult = useAppStore((s) => s.lastImport);
+  const setLastResult = useAppStore((s) => s.setLastImport);
   const go = useAppStore((s) => s.go);
   const refreshAll = useAppStore((s) => s.refreshAll);
 
   const [importing, setImporting] = useState(false);
-  const [lastResult, setLastResult] = useState<ImportResult | null>(null);
 
   async function doImport(paths: string[] | null) {
     if (!paths || paths.length === 0) return;
@@ -175,6 +205,7 @@ export default function WorkbenchView() {
       const result = await importPaths(paths);
       setLastResult(result);
       await refreshAll();
+      // 跳到录音库看新条目；提示条读的是 store 里的 lastImport，跳过去仍能看到
       if (result.imported.length > 0) go({ kind: "library" });
     } catch (e) {
       setLastResult({ imported: [], skipped: [{ path: "", reason: errMsg(e) }] });
@@ -184,22 +215,34 @@ export default function WorkbenchView() {
   }
 
   async function pickFiles() {
-    const paths = await open({
-      multiple: true,
-      filters: [
-        {
-          name: "音频",
-          extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"],
-        },
-      ],
-    });
+    let paths: string[] | string | null = null;
+    try {
+      paths = await open({
+        multiple: true,
+        filters: [
+          {
+            name: "音频",
+            extensions: ["m4a", "mp3", "wav", "amr", "3gp", "wma", "aac", "flac", "ogg", "opus"],
+          },
+        ],
+      });
+    } catch {
+      return; // 对话框异常（极少见），不提示
+    }
     await doImport(Array.isArray(paths) ? paths : paths ? [paths] : null);
   }
 
   async function pickFolder() {
-    const dir = await open({ directory: true, multiple: false });
+    let dir: string | null = null;
+    try {
+      dir = await open({ directory: true, multiple: false });
+    } catch {
+      return;
+    }
     await doImport(dir ? [dir] : null);
   }
+
+  const dragging = useAudioDrop((paths) => void doImport(paths));
 
   // ---- 统计 ----
   const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
@@ -217,13 +260,16 @@ export default function WorkbenchView() {
     .slice(0, 6);
 
   const pendingCount = activeJobs.length;
+  // 队列位次：有正在跑的任务时它占第 1 位，pending 从 2 起算；空闲时 pending 从 1 起算
+  const hasRunning = activeJobs.some((j) => j.status === "running");
   const runningIndex = new Map<number, number>();
   activeJobs
     .filter((j) => j.status === "pending")
-    .forEach((j, i) => runningIndex.set(j.id, i + 2)); // 第 1 位是正在跑的那条
+    .forEach((j, i) => runningIndex.set(j.id, i + (hasRunning ? 2 : 1)));
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="h-full relative">
+      <div className="h-full overflow-y-auto">
       <div className="max-w-5xl mx-auto p-6 space-y-5">
         {/* 头部 */}
         <div className="flex items-start gap-3">
@@ -346,7 +392,7 @@ export default function WorkbenchView() {
               </div>
             ) : (
               queueJobs.map((j) => (
-                <JobCard key={j.id} job={j} queueIndex={runningIndex.get(j.id) ?? 2} />
+                <JobCard key={j.id} job={j} queueIndex={runningIndex.get(j.id) ?? 1} />
               ))
             )}
           </div>
@@ -376,7 +422,7 @@ export default function WorkbenchView() {
               {recentRecordings.map((r: Recording) => (
                 <button
                   key={r.id}
-                  onClick={() => go({ kind: "detail", id: r.id })}
+                  onClick={() => go({ kind: "detail", id: r.id, from: "workbench" })}
                   className="flex items-center gap-3 px-4 py-3 rounded-xl bg-ink-900 border border-ink-800 hover:border-ink-600 hover:bg-ink-850 transition-colors text-left"
                 >
                   <div className="flex-1 min-w-0">
@@ -404,6 +450,8 @@ export default function WorkbenchView() {
           </div>
         )}
       </div>
+      </div>
+      {dragging && <DropMask />}
     </div>
   );
 }

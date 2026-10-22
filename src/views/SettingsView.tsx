@@ -106,8 +106,8 @@ function ModelsCard() {
 
   return (
     <Card
-      title="转写模型（本地离线）"
-      desc="Paraformer-large（字符级时间戳）+ silero-VAD + CT-Transformer 标点 · 全部在本机推理"
+      title="离线模型（本地推理）"
+      desc="Paraformer-large（字符级时间戳）+ silero-VAD + CT-Transformer 标点 + pyannote / CAM++（说话人分离）· 全部在本机推理"
     >
       {error && <div className="text-xs text-st-err">{error}</div>}
       <div className="space-y-2">
@@ -173,12 +173,133 @@ function ModelsCard() {
   );
 }
 
+/** 转写性能：限制转写能吃多少 CPU。
+ *
+ * 转写是本机纯 CPU 计算。默认「自动」= 物理核心数（至少留 2 个逻辑核心），并且转写进程
+ * 始终以低于前台的优先级运行：机器空闲时满速，一旦你动手就立刻让路。
+ * 注意别随手选「全部核心」——开满逻辑核心在 HT / 大小核机器上实测反而慢一倍（后端有实测表）。
+ */
+function PerfCard({
+  logicalCores,
+  autoThreads,
+}: {
+  logicalCores: number | null;
+  autoThreads: number | null;
+}) {
+  const [mode, setMode] = useState<"auto" | "all" | "custom">("auto");
+  const [custom, setCustom] = useState<number | null>(null);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    getSettings()
+      .then((s) => {
+        const raw = (s["perf.asrThreads"] ?? "").trim();
+        if (raw === "all") {
+          setMode("all");
+          return;
+        }
+        const n = Number(raw);
+        if (raw !== "" && Number.isInteger(n) && n >= 1) {
+          setMode("custom");
+          setCustom(n);
+        }
+      })
+      .catch((e) => setError(errMsg(e)));
+  }, []);
+
+  const logical = logicalCores ?? 0;
+  const auto = autoThreads ?? 0;
+  const customValue = custom ?? (auto > 0 ? auto : 4);
+  // 与后端 transcribe::parse_threads 一致：自定义值收敛到 [1, logical]
+  const clampToLogical = (n: number) =>
+    logical > 0 ? Math.min(Math.max(1, n), logical) : Math.max(1, n);
+
+  const options: { key: "auto" | "all" | "custom"; label: string }[] = [
+    { key: "auto", label: "自动（推荐）" },
+    { key: "all", label: "全部核心" },
+    { key: "custom", label: "自定义" },
+  ];
+
+  const core = (n: number) => (logical > 0 ? `${n} / ${logical}` : `${n}`);
+  const hint =
+    mode === "auto"
+      ? `转写用 ${core(auto)} 个逻辑核心（物理核心数，至少留 2 个给系统）`
+      : mode === "all"
+        ? `转写用全部${logical > 0 ? ` ${logical} 个` : ""}逻辑核心——HT / 大小核机器上开满实测反而更慢，一般不必选`
+        : `转写用 ${core(clampToLogical(customValue))} 个逻辑核心`;
+
+  async function save() {
+    const value =
+      mode === "auto" ? "auto" : mode === "all" ? "all" : String(clampToLogical(customValue));
+    try {
+      await setSettings({ "perf.asrThreads": value });
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 1500);
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  }
+
+  return (
+    <Card
+      title="转写性能"
+      desc="转写进程始终以低于前台的优先级运行：机器空闲时满速，你一动手就让路。这里进一步限制它占用的核心数。"
+    >
+      {error && <div className="text-xs text-st-err">{error}</div>}
+      <div className="flex gap-2">
+        {options.map((o) => (
+          <button
+            key={o.key}
+            onClick={() => setMode(o.key)}
+            className={`flex-1 px-3 py-2 rounded-lg text-sm border transition-colors ${
+              mode === o.key
+                ? "bg-ink-700 border-cyan-accent/60 text-mist-100 font-medium"
+                : "bg-ink-850 border-ink-700 text-mist-300 hover:border-ink-600"
+            }`}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+      {mode === "custom" && (
+        <label className="flex items-center gap-2 text-xs text-ink-500">
+          线程数
+          <input
+            type="number"
+            className="w-20"
+            min={1}
+            max={logical > 0 ? logical : 64}
+            value={customValue}
+            onChange={(e) => setCustom(Math.max(1, Number(e.target.value) || 1))}
+          />
+          {logical > 0 && <span>本机共 {logical} 个逻辑核心</span>}
+        </label>
+      )}
+      <div className="text-[11px] text-ink-500">{hint}</div>
+      <div className="flex items-center gap-3">
+        <button
+          className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"
+          onClick={save}
+        >
+          保存
+        </button>
+        {savedFlash && <span className="text-xs text-jade-accent">已保存 ✓</span>}
+      </div>
+      <div className="text-[11px] text-ink-500">
+        改动只影响之后排队或重新转写的任务，正在转写的那条不受影响
+      </div>
+    </Card>
+  );
+}
+
 /** 设置页：存储 / 转写模型 / AI 复盘 / 关于 */
 export default function SettingsView() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [llmBaseUrl, setLlmBaseUrl] = useState("");
   const [llmApiKey, setLlmApiKey] = useState("");
   const [llmModel, setLlmModel] = useState("");
+  const [llmThinking, setLlmThinking] = useState<"off" | "on">("off");
   const [error, setError] = useState("");
   const [savedFlash, setSavedFlash] = useState(false);
   const [rootFlash, setRootFlash] = useState("");
@@ -192,6 +313,7 @@ export default function SettingsView() {
         setLlmBaseUrl(s["llm.baseUrl"] ?? "");
         setLlmApiKey(s["llm.apiKey"] ?? "");
         setLlmModel(s["llm.model"] ?? "");
+        setLlmThinking(s["llm.thinking"] === "on" ? "on" : "off");
       })
       .catch((e) => setError(errMsg(e)));
   }, []);
@@ -202,6 +324,7 @@ export default function SettingsView() {
         "llm.baseUrl": llmBaseUrl.trim(),
         "llm.apiKey": llmApiKey.trim(),
         "llm.model": llmModel.trim(),
+        "llm.thinking": llmThinking,
       });
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 1500);
@@ -218,6 +341,7 @@ export default function SettingsView() {
         "llm.baseUrl": llmBaseUrl.trim(),
         "llm.apiKey": llmApiKey.trim(),
         "llm.model": llmModel.trim(),
+        "llm.thinking": llmThinking,
       });
       const reply = await testLlm();
       setTestResult(`连接成功：${reply.slice(0, 50)}`);
@@ -270,6 +394,11 @@ export default function SettingsView() {
 
         <ModelsCard />
 
+        <PerfCard
+          logicalCores={info?.logicalCores ?? null}
+          autoThreads={info?.autoThreads ?? null}
+        />
+
         <Card
           title="AI 复盘（LLM）"
           desc="OpenAI 兼容接口（GLM / DeepSeek / OpenAI 等）。仅转写文本会发送到所配置的服务，录音永不外传。"
@@ -304,6 +433,33 @@ export default function SettingsView() {
               placeholder="glm-4.7"
             />
           </label>
+          <div className="space-y-1">
+            <span className="text-xs text-ink-500">深度思考</span>
+            <div className="flex gap-2">
+              {(
+                [
+                  ["off", "关闭（推荐）"],
+                  ["on", "开启"],
+                ] as const
+              ).map(([v, label]) => (
+                <button
+                  key={v}
+                  onClick={() => setLlmThinking(v)}
+                  className={`flex-1 px-3 py-2 rounded-lg text-sm border transition-colors ${
+                    llmThinking === v
+                      ? "bg-ink-700 border-cyan-accent/60 text-mist-100 font-medium"
+                      : "bg-ink-850 border-ink-700 text-mist-300 hover:border-ink-600"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="text-[11px] text-ink-500">
+              关闭：出稿快、省 token，原话引用更忠实，纪要提炼足够用。开启：条目更细但耗时与
+              token 成倍增加，且输出上限需相应调大。
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             <button
               className="px-3 py-1.5 rounded-lg text-sm bg-ink-700 hover:bg-ink-600 text-mist-200"

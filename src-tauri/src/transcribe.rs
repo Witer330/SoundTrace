@@ -136,6 +136,16 @@ impl TranscribeWorker {
         );
     }
 
+    /// 转写性能设置里的线程数 token（见 `SETTING_ASR_THREADS`）。
+    /// 在**任务开始时**读取，改动只影响之后入队的任务。
+    fn asr_threads(&self) -> String {
+        self.db
+            .get_setting(SETTING_ASR_THREADS)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
     /// 在**子进程**里跑完整转写流水线，返回分段行。
     ///
     /// 为什么是子进程：原生识别引擎在特定内容上会破坏栈保护并让进程直接退出，
@@ -149,13 +159,18 @@ impl TranscribeWorker {
         let out_json = cache.join(format!("job-{}.json", job.id));
         let _ = std::fs::remove_file(&out_json);
 
-        let exe = child_exe_path()?;
-        let mut child = Command::new(&exe)
+        let exe = job_runner::child_exe_path("st-transcribe")?;
+        let mut cmd = Command::new(&exe);
+        // 转写动辄几十分钟且吃满 CPU，降到低于前台的优先级：机器空闲时照常满速，
+        // 一旦用户做别的事就立刻让路。子进程内部的 ffmpeg 解码会继承这一优先级。
+        crate::priority::background(&mut cmd);
+        let mut child = cmd
             .arg(job.recording_id.to_string())
             .arg(&job.file_path)
             .arg(paths::models_dir(&self.data_root))
             .arg(&cache)
             .arg(&out_json)
+            .arg(self.asr_threads())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -260,47 +275,6 @@ impl TranscribeWorker {
     }
 }
 
-/// 定位转写子进程可执行文件。
-///
-/// 查找顺序（命中即返回）：
-/// 1. 与主程序同目录 —— 开发时 `cargo build` 把 bin 与 lib 放在同一 profile 目录；
-/// 2. 上一级目录 —— 从 `target/<profile>/deps/` 运行测试时，bin 在上一级；
-/// 3. `<主程序目录>/Resources/` —— Tauri 打包（bundle.resources）把外部二进制放这里，
-///    Windows 上形如 `C:\Program Files\SoundTrace\Resources\st-transcribe.exe`。
-fn child_exe_path() -> AppResult<PathBuf> {
-    let exe = std::env::current_exe()
-        .map_err(|e| err(format!("无法定位当前可执行文件：{e}")))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| err("无法定位当前可执行文件所在目录"))?;
-    let name = if cfg!(windows) {
-        "st-transcribe.exe"
-    } else {
-        "st-transcribe"
-    };
-
-    let mut candidates: Vec<PathBuf> = vec![dir.join(name)];
-    if let Some(parent) = dir.parent() {
-        candidates.push(parent.join(name));
-    }
-    candidates.push(dir.join("Resources").join(name));
-
-    for c in &candidates {
-        if c.is_file() {
-            return Ok(c.clone());
-        }
-    }
-    Err(err(format!(
-        "找不到转写引擎。开发时请执行 `cargo build`；打包前请运行 `node tools/build-sidecar.mjs`。\
-         已查找：{}",
-        candidates
-            .iter()
-            .map(|c| c.display().to_string())
-            .collect::<Vec<_>>()
-            .join("、")
-    )))
-}
-
 /// 把一次转写的结果落库，返回 (job 状态, 录音状态, 进度, 错误文本) 供事件推送。
 ///
 /// 成功：整批替换该录音的分段并把两边都置为 done。
@@ -352,6 +326,25 @@ pub fn finalize_job(
             )
             .unwrap();
             tx.commit().unwrap();
+            // 预设了人数的录音：转写完成自动接分离——入队后由常驻分离线程串行执行。
+            // 这是「转写前预设人数、一步到位」的产品路径；没预设就到此为止。
+            // 注意：此处已持有 conn 锁，必须用 conn 直接查，不能再走 db.get_setting（会自死锁）
+            let preset: Option<i64> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?1",
+                    [&crate::diar::clusters_setting_key(job.recording_id)],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|n| (1..=32).contains(n));
+            if preset.is_some() {
+                let _ = conn.execute(
+                    "INSERT INTO jobs(recording_id, kind, status, created_at, updated_at)
+                     VALUES(?1,'diarize','pending',?2,?2)",
+                    rusqlite::params![job.recording_id, now],
+                );
+            }
             ("done".into(), "done".into(), 1.0, String::new())
         }
         Err(e) => {
@@ -371,6 +364,40 @@ pub fn finalize_job(
     }
 }
 
+/// 设置页「转写性能」写入的线程数 token：`auto`（默认）| `all` | 正整数。
+pub const SETTING_ASR_THREADS: &str = "perf.asrThreads";
+
+/// 解析 ASR 线程数设置（`perf.asrThreads` 的取值）。
+///
+/// - `"all"` → 全部逻辑核心
+/// - 正整数 `N` → `N`，并按 `[1, logical]` 收敛，防止设置里写入越界值
+/// - 其他（`"auto"`、缺失、无法解析）→ `cpu::auto_threads`，即物理核心数（至少留 2 个逻辑核心）
+///
+/// `physical` 由调用方传入只是为了让测试可控；生产路径用 [`parse_threads`]。
+pub fn parse_threads_with(setting: &str, logical: usize, physical: Option<usize>) -> i32 {
+    let logical = logical.max(1);
+    let trimmed = setting.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return logical as i32;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if n >= 1 => n.clamp(1, logical) as i32,
+        _ => crate::cpu::auto_threads_with(logical, physical) as i32,
+    }
+}
+
+/// 解析 ASR 线程数设置，自动模式按本机实际拓扑取值。
+pub fn parse_threads(setting: &str, logical: usize) -> i32 {
+    parse_threads_with(setting, logical, crate::cpu::physical_cores())
+}
+
+/// 实际使用的 ASR 线程数。环境变量 `ST_ASR_THREADS` 优先于设置，供基准测试扫描线程数
+/// （与 `ST_MODELS_DIR`、`ST_PROBE_*` 同一惯例）。
+pub fn resolve_threads(setting: &str) -> i32 {
+    let setting = std::env::var("ST_ASR_THREADS").unwrap_or_else(|_| setting.to_string());
+    parse_threads(&setting, crate::cpu::logical_cores())
+}
+
 /// 纯核心流水线：解码 → VAD 分段 → Paraformer 识别（字符时间戳）→ 标点。
 /// 与 UI 解耦，可独立测试。
 pub fn run_pipeline(
@@ -378,6 +405,7 @@ pub fn run_pipeline(
     models_root: &std::path::Path,
     cache_dir: &std::path::Path,
     recording_id: i64,
+    asr_threads: &str,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(f64),
 ) -> AppResult<Vec<SegRow>> {
@@ -409,9 +437,7 @@ pub fn run_pipeline(
     let total_samples = samples.len().max(1) as f64;
 
     // 2) 构建识别器 / VAD / 标点
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(4);
+    let num_threads = resolve_threads(asr_threads);
     let mut asr_config = OfflineRecognizerConfig::default();
     asr_config.model_config.paraformer = OfflineParaformerModelConfig {
         model: Some(layout.asr_model().to_string_lossy().into_owned()),
@@ -547,6 +573,47 @@ fn recognize_segment(
 mod tests {
     use super::*;
 
+    /// 线程数解析：设置页的三种取值，加上越界与垃圾输入的防御。
+    /// 「自动」在带超线程的机器上取物理核心数（实测比全逻辑核心快一倍以上，见 `cpu` 模块）。
+    #[test]
+    fn parse_threads_covers_settings_and_bad_input() {
+        let (logical, physical) = (20usize, Some(14usize));
+        assert_eq!(parse_threads_with("auto", logical, physical), 14);
+        assert_eq!(parse_threads_with("", logical, physical), 14);
+        assert_eq!(parse_threads_with("all", logical, physical), 20);
+        assert_eq!(parse_threads_with("ALL", logical, physical), 20);
+        assert_eq!(parse_threads_with("  all  ", logical, physical), 20);
+        // 自定义：收敛到 [1, logical]
+        assert_eq!(parse_threads_with("6", logical, physical), 6);
+        assert_eq!(parse_threads_with("999", logical, physical), 20);
+        // 非法输入一律退回自动，不能让识别器拿到 0 或负数
+        assert_eq!(parse_threads_with("0", logical, physical), 14);
+        assert_eq!(parse_threads_with("-3", logical, physical), 14);
+        assert_eq!(parse_threads_with("abc", logical, physical), 14);
+        // 无超线程：物理 = 逻辑时仍要留 2 个给系统
+        assert_eq!(parse_threads_with("auto", 8, Some(8)), 6);
+        // 拿不到物理核心数：退回「逻辑 - 2」
+        assert_eq!(parse_threads_with("auto", 20, None), 18);
+        // 极低核心数下也必须 ≥ 1
+        assert_eq!(parse_threads_with("auto", 2, Some(2)), 1);
+        assert_eq!(parse_threads_with("auto", 1, Some(1)), 1);
+    }
+
+    /// 无论机器多少核、设置写什么，结果都必须落在 [1, logical] 内。
+    #[test]
+    fn parse_threads_always_in_range() {
+        let topologies = [(4usize, Some(2usize)), (8, Some(4)), (20, Some(14)), (16, None)];
+        for (logical, physical) in topologies {
+            for setting in ["auto", "all", "1", "7", "64", "1000", "0", "", "x"] {
+                let n = parse_threads_with(setting, logical, physical);
+                assert!(
+                    n >= 1 && n as usize <= logical,
+                    "logical={logical} physical={physical:?} setting={setting:?} 得到 {n}"
+                );
+            }
+        }
+    }
+
     /// 端到端：TTS 生成中文语音 → 下载模型（缺失时）→ 完整转写流水线。
     /// 模型安装到 ~/SoundTrace/models（与正式应用共用，一次下载处处可用）。
     #[test]
@@ -588,7 +655,7 @@ $s.Dispose()
 
         // 3) 转写流水线
         let cancel = AtomicBool::new(false);
-        let rows = run_pipeline(&wav, &models_root, &dir, -1, &cancel, |_| {})
+        let rows = run_pipeline(&wav, &models_root, &dir, -1, "auto", &cancel, |_| {})
             .expect("转写流水线失败");
 
         let full: String = rows.iter().map(|r| r.text.clone()).collect();

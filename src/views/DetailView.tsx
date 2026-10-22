@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import PlayerBar from "../components/PlayerBar";
+import PlayerBar, { SPEEDS } from "../components/PlayerBar";
 import TranscriptPanel from "../components/TranscriptPanel";
 import SummaryPanel from "../components/SummaryPanel";
 import PipelinePanel from "../components/PipelinePanel";
@@ -26,12 +26,32 @@ import {
   formatMsTime,
   STATUS_LABEL,
   type Bookmark,
+  type ListViewKind,
   type Recording,
 } from "../types";
 
 type Tab = "transcript" | "summary" | "info";
 
-export default function DetailView({ id, seekMs }: { id: number; seekMs?: number }) {
+const SPEED_KEY = "st.speed";
+
+function readSavedSpeed(): number {
+  try {
+    const v = Number(localStorage.getItem(SPEED_KEY));
+    return SPEEDS.includes(v) ? v : 1;
+  } catch {
+    return 1;
+  }
+}
+
+export default function DetailView({
+  id,
+  seekMs,
+  from,
+}: {
+  id: number;
+  seekMs?: number;
+  from?: ListViewKind;
+}) {
   const go = useAppStore((s) => s.go);
   const jobs = useAppStore((s) => s.jobs);
   const [rec, setRec] = useState<Recording | null>(null);
@@ -40,6 +60,8 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   const [savedFlash, setSavedFlash] = useState(false);
   const [tab, setTab] = useState<Tab>("transcript");
   const [segCount, setSegCount] = useState(0);
+  // 转写稿有未保存草稿时，切页签/返回前先确认
+  const [transcriptDirty, setTranscriptDirty] = useState(false);
 
   // 播放器状态
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -48,14 +70,19 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   const [peaksLoading, setPeaksLoading] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState(1);
+  // 倍速全局记住，播放位置按录音记住（localStorage）
+  const [speed, setSpeed] = useState(readSavedSpeed);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const posKey = `st.pos.${id}`;
+  const lastPosSaveRef = useRef(0);
 
   // 编辑态
   const [title, setTitle] = useState("");
   const [participants, setParticipants] = useState("");
   const [tagsText, setTagsText] = useState("");
   const [notes, setNotes] = useState("");
+  // 标题是否被用户改过：没改过就跟随后端（AI 纪要完成后主题会自动回填标题），改过则草稿优先
+  const titleDirtyRef = useRef(false);
 
   const job = useMemo(
     () => jobs.find((j) => j.recordingId === id && (j.status === "running" || j.status === "pending")),
@@ -76,6 +103,12 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
       })
       .catch(() => undefined);
   }, [id]);
+
+  // 未被用户编辑过的标题跟随后端：纪要生成完成后主题自动回填，编辑框不能停在旧值，
+  // 否则用户接着点「保存」会把旧标题写回去并误标记为手工命名
+  useEffect(() => {
+    if (rec && !titleDirtyRef.current) setTitle(rec.title);
+  }, [rec]);
 
   /**
    * 详情页的数据入口。后端读不到时回退到 store 里已加载的行（列表数据通常够渲染），
@@ -104,8 +137,43 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
     if (pending !== null) {
       pendingSeekRef.current = null;
       seek(pending / 1000);
+      return;
+    }
+    // 没有显式跳转时恢复上次播放位置（已听完或位置失效则从头开始）
+    try {
+      const saved = Number(localStorage.getItem(posKey));
+      const dur = audioRef.current?.duration ?? 0;
+      if (saved > 1000 && (!dur || Number.isNaN(dur) || saved < dur - 500)) seek(saved / 1000);
+    } catch {
+      // localStorage 不可用就当没有记忆
     }
   }
+
+  /** 播放位置节流落盘（2 秒一次），暂停/关闭前的位置在下次 timeupdate 里已经存住 */
+  const handleTimeUpdate = useCallback(
+    (sec: number) => {
+      setCurrentTime(sec);
+      const now = Date.now();
+      if (now - lastPosSaveRef.current >= 2000) {
+        lastPosSaveRef.current = now;
+        try {
+          localStorage.setItem(posKey, String(Math.round(sec * 1000)));
+        } catch {
+          // 忽略
+        }
+      }
+    },
+    [posKey],
+  );
+
+  const changeSpeed = useCallback((s: number) => {
+    setSpeed(s);
+    try {
+      localStorage.setItem(SPEED_KEY, String(s));
+    } catch {
+      // 忽略
+    }
+  }, []);
 
   const addBookmarkHere = useCallback(async () => {
     if (!rec) return;
@@ -120,6 +188,8 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   }, [rec, currentTime]);
 
   useEffect(() => {
+    // 切换录音时重置标题草稿标记
+    titleDirtyRef.current = false;
     const fallback = fallbackRec();
     getRecording(id)
       .then((r) => {
@@ -186,6 +256,25 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
     return () => window.removeEventListener("keydown", onKey);
   }, [addBookmarkHere]);
 
+  /** 有未保存草稿时先确认；同意离开则清掉脏标记 */
+  function confirmDiscardDirty(): boolean {
+    if (tab !== "transcript" || !transcriptDirty) return true;
+    if (window.confirm("转写稿有未保存的修改，离开将丢弃。确定离开吗？")) {
+      setTranscriptDirty(false);
+      return true;
+    }
+    return false;
+  }
+
+  function goBack() {
+    if (confirmDiscardDirty()) go({ kind: from ?? "workbench" });
+  }
+
+  function switchTab(next: Tab) {
+    if (next !== tab && !confirmDiscardDirty()) return;
+    setTab(next);
+  }
+
   async function save() {
     if (!rec) return;
     setSaving(true);
@@ -208,11 +297,11 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
 
   async function doDelete() {
     if (!rec) return;
-    const choice = window.confirm(
-      `确定删除「${rec.title}」吗？\n\n"删除"仅移除库记录（保留归档文件）；"彻底删除"同时删除音频文件，不可恢复。`,
-    );
+    const choice = window.confirm(`确定删除「${rec.title}」吗？此操作不可撤销。`);
     if (!choice) return;
-    const wipe = window.confirm("是否同时删除归档的音频文件？（取消 = 仅移除库记录）");
+    const wipe = window.confirm(
+      "是否同时删除归档的音频文件？\n\n确定 = 彻底删除（连音频文件一起，不可恢复）\n取消 = 仅从库中移除（音频文件保留）",
+    );
     try {
       await deleteRecording(id, wipe);
       go({ kind: "library" });
@@ -255,7 +344,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
         <div className="text-st-err text-sm">{error}</div>
         <button
           className="text-mist-400 hover:text-mist-200 text-sm"
-          onClick={() => go({ kind: "workbench" })}
+          onClick={() => go({ kind: from ?? "workbench" })}
         >
           返回工作台
         </button>
@@ -276,14 +365,14 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
   ];
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col relative">
       {/* 头部条 */}
       <div className="flex items-center gap-3 px-4 h-14 border-b border-ink-800 bg-ink-900/60 shrink-0">
         <button
           className="text-mist-400 hover:text-mist-200 text-sm shrink-0"
-          onClick={() => go({ kind: "workbench" })}
+          onClick={goBack}
         >
-          ← 返回
+          {from === "search" ? "← 返回搜索" : from === "library" ? "← 返回录音库" : "← 返回"}
         </button>
         <div className="min-w-0 flex items-baseline gap-2 flex-1">
           <span className="text-mist-100 truncate font-medium">{rec.title}</span>
@@ -361,10 +450,10 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
                   playing={playing}
                   speed={speed}
                   audioRef={audioRef}
-                  onTimeUpdate={setCurrentTime}
+                  onTimeUpdate={handleTimeUpdate}
                   onPlayingChange={setPlaying}
                   onSeek={seek}
-                  onSpeedChange={setSpeed}
+                  onSpeedChange={changeSpeed}
                   onAddBookmark={addBookmarkHere}
                   onLoadedMetadata={onAudioMetadata}
                   onLoadError={(m) => {
@@ -407,7 +496,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
             {tabs.map((t) => (
               <button
                 key={t.key}
-                onClick={() => setTab(t.key)}
+                onClick={() => switchTab(t.key)}
                 className={`px-3 py-1.5 rounded-lg text-sm transition-colors flex items-center gap-1.5 ${
                   tab === t.key
                     ? "bg-ink-800 text-mist-100 font-medium"
@@ -438,6 +527,7 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
                   rec={rec}
                   currentTime={currentTime}
                   seek={seek}
+                  onDirtyChange={setTranscriptDirty}
                   onChanged={() => {
                     refreshRec();
                     listSegments(id)
@@ -448,7 +538,9 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
               </div>
             )}
 
-            {tab === "summary" && <SummaryPanel rec={rec} onChanged={refreshRec} />}
+            {tab === "summary" && (
+              <SummaryPanel rec={rec} seek={seek} onChanged={refreshRec} />
+            )}
 
             {tab === "info" && (
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 max-w-4xl">
@@ -485,7 +577,10 @@ export default function DetailView({ id, seekMs }: { id: number; seekMs?: number
                       type="text"
                       className="w-full"
                       value={title}
-                      onChange={(e) => setTitle(e.target.value)}
+                      onChange={(e) => {
+                        titleDirtyRef.current = true;
+                        setTitle(e.target.value);
+                      }}
                     />
                   </label>
                   <label className="block space-y-1">

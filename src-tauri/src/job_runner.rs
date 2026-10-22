@@ -40,9 +40,56 @@ pub enum PipelineOutput {
     Failure { error: String },
 }
 
-/// 子进程命令行参数（顺序固定，便于父进程拼装与子进程解析）
+/// 子进程命令行参数（顺序固定，便于父进程拼装与子进程解析）。
+/// `asr_threads` 可省略，省略等价于 `auto`（见 `transcribe::SETTING_ASR_THREADS`）。
 pub const CHILD_ARG_USAGE: &str =
-    "<recording_id> <audio_file> <models_root> <cache_dir> <out_json>";
+    "<recording_id> <audio_file> <models_root> <cache_dir> <out_json> [asr_threads]";
+
+/// 分离子进程（`src/bin/st-diarize.rs`）的参数：人数必填（锁人数是产品路径，
+/// 见 `diar` 模块顶部说明），无「自动」档。
+pub const DIAR_CHILD_ARG_USAGE: &str =
+    "<recording_id> <audio_file> <models_root> <cache_dir> <out_json> <num_clusters>";
+
+/// 定位子进程可执行文件。
+///
+/// 查找顺序（命中即返回）：
+/// 1. 与主程序同目录 —— 开发时 `cargo build` 把 bin 与 lib 放在同一 profile 目录；
+/// 2. 上一级目录 —— 从 `target/<profile>/deps/` 运行测试时，bin 在上一级；
+/// 3. `<主程序目录>/Resources/` —— Tauri 打包（bundle.resources）把外部二进制放这里，
+///    Windows 上形如 `C:\Program Files\SoundTrace\Resources\st-transcribe.exe`。
+pub fn child_exe_path(name: &str) -> crate::error::AppResult<std::path::PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| crate::error::err(format!("无法定位当前可执行文件：{e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| crate::error::err("无法定位当前可执行文件所在目录"))?;
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+
+    let mut candidates: Vec<std::path::PathBuf> = vec![dir.join(&file)];
+    if let Some(parent) = dir.parent() {
+        candidates.push(parent.join(&file));
+    }
+    candidates.push(dir.join("Resources").join(&file));
+
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.clone());
+        }
+    }
+    Err(crate::error::err(format!(
+        "找不到子进程引擎 {file}。开发时请执行 `cargo build`；打包前请运行 `node tools/build-sidecar.mjs`。\
+         已查找：{}",
+        candidates
+            .iter()
+            .map(|c| c.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    )))
+}
 
 /// 把子进程的退出态翻译成用户可读的失败原因。
 /// `stderr_tail` 是子进程最后输出的错误片段（原生层的报错在这里，对排查很有用）。
